@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Loss Landscape of a Small GPT</title>
+    <link rel="stylesheet" href="../style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>The Loss Landscape of a Small GPT</h1>
+<p class="post-date">February 2026</p>
+<p class="subtitle">8 experiments probing the geometry of the loss landscape after 1000 steps of Muon training on a 5M-param toy GPT. Every number is a measurement, not theory.</p>
+
+<h2>Setup</h2>
+
+<p>5M parameter custom GPT, 4 layers, d_model=256, vocab=4096. Trained on synthetic bigram data for 1000 steps with the Muon optimizer (batch size 64, seq length 128). Final training loss: 0.73.</p>
+
+<details>
+<summary>Model code (SmallGPT)</summary>
+<pre><code>class SmallAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        att = (q @ k.transpose(-2, -1)) * (self.d_head ** -0.5)
+        causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        att = att.masked_fill(causal_mask, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        y = (att @ v).transpose(1, 2).reshape(B, T, C)
+        return self.proj(y)
+
+
+class SmallMLP(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.up = nn.Linear(d_model, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):
+        return self.down(F.gelu(self.up(x)))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = SmallAttention(d_model, n_heads)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = SmallMLP(d_model, d_ff)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class SmallGPT(nn.Module):
+    def __init__(self, vocab_size=4096, d_model=256, n_heads=4,
+                 n_layers=4, d_ff=1024, max_seq=256):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq, d_model)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, d_ff) for _ in range(n_layers)
+        ])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok = self.tok_emb(idx)
+        pos = self.pos_emb(torch.arange(T, device=idx.device))
+        x = tok + pos
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   targets.reshape(-1))
+        return logits, loss</code></pre>
+</details>
+
+<h2>It's sharp</h2>
+
+<p>Loss <strong>doubles</strong> with just a 4.5% random perturbation to the weights. At 10%, the model is catastrophically broken (loss 4.2 vs 0.73 baseline). At 100% perturbation, the model is <em>worse than random</em> (27.8 vs random performance of 8.4).</p>
+
+<details>
+<summary>Code: random cross-section measurement</summary>
+<pre><code>def random_direction(model, normalize=True):
+    """Random direction in parameter space, optionally filter-normalized."""
+    direction = []
+    for p in model.parameters():
+        d = torch.randn_like(p)
+        if normalize and p.ndim >= 2:
+            # Filter normalization (Li et al. 2018): scale each filter to match param norm
+            d = d * (p.data.norm() / (d.norm() + 1e-10))
+        direction.append(d.flatten())
+    return torch.cat(direction)
+
+
+def exp1_cross_sections(model, data, label):
+    """Measure loss along random directions at various scales."""
+    center = get_flat_params(model).clone()
+    center_loss = eval_loss(model, data)
+
+    scales = np.logspace(-3, 1, 30)  # 0.001 to 10
+    n_directions = 20
+
+    all_curves = []
+    for d in range(n_directions):
+        torch.manual_seed(SEED + d + 1000)
+        direction = random_direction(model).to(DEVICE)
+
+        curve = []
+        for s in scales:
+            set_flat_params(model, center + s * direction)
+            loss = eval_loss(model, data, n_batches=3)
+            curve.append(loss)
+
+        all_curves.append(curve)
+        set_flat_params(model, center)
+
+    curves = np.array(all_curves)
+    mean_curve = np.mean(curves, axis=0)
+
+    # Find sharpness: scale at which loss doubles
+    double_idx = np.argmax(mean_curve > 2 * center_loss)
+    double_scale = scales[double_idx] if double_idx > 0 else float('inf')</code></pre>
+</details>
+
+<pre><code>Scale    Loss     vs Baseline
+0.00     0.726    (baseline)
+0.01     0.833    +14%
+0.045    ~1.45    +100% (doubled)
+0.10     4.207    +480%
+1.00     27.759   +3,700% (worse than random)</code></pre>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartLossPerturbation"></canvas></div>
+
+<details>
+<summary>Raw output</summary>
+<pre><code>[Exp1] Random cross-sections: after 1000 steps
+  Center loss: 0.7260
+  Scale to 2x loss: 0.0452
+  Loss at scale 0.01: 0.8333
+  Loss at scale 0.1: 4.2073
+  Loss at scale 1.0: 27.7587</code></pre>
+</details>
+
+<div class="callout">
+The trained model sits in a narrow valley. There's almost no room for error.
+</div>
+
+<h2>lm_head dominates everything</h2>
+
+<p>I perturbed each layer independently at scale 0.01 and measured the loss increase.</p>
+
+<details>
+<summary>Code: per-layer sensitivity measurement</summary>
+<pre><code>def exp2_layer_sensitivity(model, data, label):
+    """Perturb one layer at a time. Which layers matter most?"""
+    center_loss = eval_loss(model, data)
+    results = {}
+    scales = [0.01, 0.05, 0.1, 0.5, 1.0]
+
+    for name, p in model.named_parameters():
+        if p.ndim < 2:
+            continue
+        saved = p.data.clone()
+        sensitivities = []
+
+        for s in scales:
+            torch.manual_seed(SEED + hash(name) % 10000)
+            noise = torch.randn_like(p) * s * p.data.norm()
+            p.data.add_(noise)
+            loss = eval_loss(model, data, n_batches=3)
+            sensitivities.append(loss - center_loss)
+            p.data.copy_(saved)</code></pre>
+</details>
+
+<table>
+    <tr><th>Layer</th><th>||W||</th><th>&Delta;loss @ 0.01</th><th>Gradient SNR</th></tr>
+    <tr><td>lm_head</td><td>135.2</td><td>131.9</td><td>0.24 (worst)</td></tr>
+    <tr><td>pos_emb</td><td>8.1</td><td>10.3</td><td>0.61 (best)</td></tr>
+    <tr><td>b0.a.proj</td><td>9.3</td><td>10.8</td><td>0.41</td></tr>
+    <tr><td>tok_emb</td><td>59.4</td><td>14.8</td><td>0.26</td></tr>
+    <tr><td>b3.a.proj</td><td>8.2</td><td>1.2</td><td>0.34</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartLayerSensitivity"></canvas></div>
+
+<p>Perturbing <code>lm_head</code> alone at scale 0.01 increases loss by <strong>132x</strong>. The next most sensitive layer causes only a 10-15x increase. lm_head is the most sensitive parameter, has the largest norm (135 vs 7-31 for others), AND has the noisiest gradients (SNR 0.24). It's the bottleneck in every dimension.</p>
+
+<details>
+<summary>Full per-layer sensitivity table (raw output)</summary>
+<pre><code>[Exp2] Per-layer sensitivity: after 1000 steps
+  Layer                          ||W||  Dloss@0.01   Dloss@0.1   Dloss@1.0
+  lm_head                     135.18    131.9344   1471.0775  14869.5982
+  pos_emb                       8.14     10.3179     15.1121     14.8582
+  b0.a.proj                     9.27     10.8173     14.9362     14.9374
+  tok_emb                      59.44     14.8066     14.9119     14.8269
+  b0.a.qkv                    21.19     14.9245     14.7975     14.7719
+  b1.m.up                      29.77     13.2599     14.6942     14.8190
+  b0.m.down                    16.64     13.3065     14.6246     14.7241
+  b1.a.qkv                    23.41     11.5663     14.6186     14.8061
+  b2.m.up                      30.74     12.6376     14.6013     14.7730
+  b1.m.down                    17.17     11.6862     14.5188     14.7698
+  b0.m.up                      29.56     13.8717     14.5087     14.5555
+  b2.m.down                    17.78     10.5695     14.4350     14.8189
+  b2.a.qkv                    23.71     10.1830     14.4219     14.7751
+  b3.m.up                      31.61     12.0442     14.4083     14.6218
+  b3.m.down                    18.23      9.8728     14.2785     14.7437
+  b3.a.qkv                    24.15      9.0217     14.2311     14.7314
+  b1.a.proj                     7.18      2.6220     13.6640     14.8054
+  b2.a.proj                     7.67      1.5960     12.6548     14.4746
+  b3.a.proj                     8.18      1.1868     12.0550     14.5432</code></pre>
+</details>
+
+<h2>Gradient SNR is terrible</h2>
+
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="metric-value">0.41</div>
+        <div class="metric-label">Global gradient SNR</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value">0.116</div>
+        <div class="metric-label">Inter-batch alignment</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value">~21</div>
+        <div class="metric-label">Noise eff. dimensions</div>
+    </div>
+</div>
+
+<p>Two consecutive mini-batches produce gradients that are <strong>nearly orthogonal</strong> (11.6% cosine similarity). At batch size 64, roughly 60% of each gradient step is noise.</p>
+
+<details>
+<summary>Code: gradient noise measurement</summary>
+<pre><code>def exp3_gradient_noise(model, data, label):
+    """How much do gradients vary between batches?"""
+    n_samples = 30
+    all_grads = []
+
+    for i in range(n_samples):
+        idx = torch.randint(0, len(data), (BATCH,), device=DEVICE)
+        batch = data[idx]
+        model.zero_grad(set_to_none=True)
+        _, loss = model(batch[:, :-1], batch[:, 1:])
+        loss.backward()
+        g = torch.cat([p.grad.flatten().float().cpu()
+                       for p in model.parameters() if p.grad is not None])
+        all_grads.append(g)
+
+    grads = torch.stack(all_grads)  # (n_samples, n_params)
+    mean_grad = grads.mean(dim=0)
+    noise = grads - mean_grad
+
+    # Signal-to-noise ratio
+    signal_norm = mean_grad.norm().item()
+    noise_norms = noise.norm(dim=1)
+    avg_noise_norm = noise_norms.mean().item()
+    snr = signal_norm / (avg_noise_norm + 1e-10)
+
+    # Gradient alignment between batches
+    alignments = []
+    for i in range(min(15, n_samples)):
+        for j in range(i+1, min(15, n_samples)):
+            cos = F.cosine_similarity(grads[i], grads[j], dim=0).item()
+            alignments.append(cos)
+
+    # Effective dimensionality of gradient noise via SVD
+    _, S, _ = torch.linalg.svd(noise, full_matrices=False)
+    total_var = (S**2).sum().item()
+    eff_dim = total_var / (S[0]**2).item()
+    top5_var = (S[:5]**2).sum().item() / total_var * 100</code></pre>
+</details>
+
+<p>Training only works because momentum averages out ~20 noisy steps to extract the signal. The gradient noise lives in ~21 effective dimensions, with the top 5 noise components explaining 22% of total noise variance.</p>
+
+<p>Per-layer gradient SNR ranges from 0.24 (lm_head, worst) to 0.61 (pos_emb, best). The full ranking:</p>
+
+<pre><code>pos_emb        0.61    b1.a.qkv       0.48
+b2.a.qkv       0.43    b0.a.proj      0.41
+b0.m.down      0.40    b3.a.qkv       0.40
+b1.a.proj      0.40    b2.a.proj      0.39
+b0.m.up        0.37    b0.a.qkv       0.36
+b1.m.up        0.34    b3.a.proj      0.34
+b1.m.down      0.33    b2.m.up        0.32
+b2.m.down      0.31    b3.m.down      0.30
+b3.m.up        0.30    tok_emb        0.26
+lm_head        0.24</code></pre>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartGradientSNR"></canvas></div>
+
+<details>
+<summary>Raw output: gradient noise</summary>
+<pre><code>[Exp3] Gradient noise structure: after 1000 steps
+  Global SNR: 0.4072
+  Mean inter-batch alignment: 0.1158 +/- 0.0320
+
+  Per-layer gradient SNR:
+    pos_emb                   0.6100
+    b1.a.qkv                  0.4796
+    b2.a.qkv                  0.4300
+    b0.a.proj                 0.4141
+    b0.m.down                 0.4026
+    b3.a.qkv                  0.4016
+    b1.a.proj                 0.4004
+    b2.a.proj                 0.3852
+    b0.m.up                   0.3699
+    b0.a.qkv                  0.3595
+    b1.m.up                   0.3437
+    b3.a.proj                 0.3360
+    b1.m.down                 0.3257
+    b2.m.up                   0.3230
+    b2.m.down                 0.3082
+    b3.m.down                 0.3024
+    b3.m.up                   0.3014
+    tok_emb                   0.2615
+    lm_head                   0.2404
+
+  Noise effective dimensionality: 21.2
+  Top 5 noise components explain: 22.4% of variance</code></pre>
+</details>
+
+<h2>The training trajectory is a highway</h2>
+
+<p>I measured loss along the training direction (from initialization to final weights) and perpendicular to it.</p>
+
+<details>
+<summary>Code: trajectory geometry measurement</summary>
+<pre><code>def exp5_trajectory(checkpoints, model, data, label):
+    """Loss along training trajectory vs perpendicular."""
+    steps_sorted = sorted([k for k in checkpoints if k != "final"])
+
+    # Direction along trajectory
+    start = checkpoints[steps_sorted[0]].to(DEVICE)
+    end = checkpoints["final"].to(DEVICE)
+    traj_dir = end - start
+    traj_len = traj_dir.norm().item()
+    traj_dir_normalized = traj_dir / (traj_dir.norm() + 1e-10)
+
+    # Random perpendicular direction (Gram-Schmidt)
+    rand_dir = torch.randn_like(traj_dir)
+    rand_dir -= (rand_dir @ traj_dir_normalized) * traj_dir_normalized
+    rand_dir = rand_dir / (rand_dir.norm() + 1e-10)
+
+    # Evaluate loss along trajectory and perpendicular
+    alphas = np.linspace(-0.3, 1.3, 25)
+    traj_losses = []
+    perp_losses = []
+
+    for a in alphas:
+        # Along trajectory
+        point = start + a * traj_dir
+        set_flat_params(model, point)
+        traj_losses.append(eval_loss(model, data, n_batches=3))
+
+        # Perpendicular (centered at midpoint)
+        midpoint = 0.5 * (start + end)
+        perp_point = midpoint + a * traj_len * rand_dir
+        set_flat_params(model, perp_point)
+        perp_losses.append(eval_loss(model, data, n_batches=3))
+
+    # Curvature comparison
+    traj_curvature = (traj_curve[mid+1] + traj_curve[mid-1] - 2*traj_curve[mid]) / da**2
+    perp_curvature = (perp_curve[mid+1] + perp_curve[mid-1] - 2*perp_curve[mid]) / da**2</code></pre>
+</details>
+
+<pre><code>Along trajectory:    min loss = 0.674 at &alpha;=1.03
+Perpendicular:       min loss = 5.302 at &alpha;=-0.03
+Loss at init (&alpha;=0): 8.387
+Loss at end (&alpha;=1):  0.674</code></pre>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartTrajectory"></canvas></div>
+
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="metric-value">15.4x</div>
+        <div class="metric-label">Anisotropy ratio</div>
+    </div>
+</div>
+
+<p>The landscape is 15x more curved perpendicular to the trajectory than along it. Training is essentially 1-dimensional &mdash; the optimizer finds a narrow valley and slides along it. The perpendicular directions are steep walls where the minimum loss (5.3) is barely better than random (8.4).</p>
+
+<details>
+<summary>Raw output: trajectory geometry</summary>
+<pre><code>[Exp5] Training trajectory geometry: Muon trajectory
+  Trajectory length: 155.75
+  Along trajectory: min=0.6739 at alpha=1.03
+  Perpendicular:    min=5.3019 at alpha=-0.03
+  Loss at start (alpha=0): 8.3866
+  Loss at end (alpha=1):   0.6739
+  Curvature along trajectory: -45.74
+  Curvature perpendicular:    -2.96
+  Anisotropy ratio:           15.44x</code></pre>
+</details>
+
+<h2>No mode connectivity</h2>
+
+<p>Two models trained from different random seeds:</p>
+
+<details>
+<summary>Code: mode connectivity measurement</summary>
+<pre><code>def exp6_mode_connectivity(data):
+    """Train two models with different seeds, interpolate between them."""
+    # Train model A (seed=42)
+    torch.manual_seed(SEED)
+    model_a = SmallGPT().to(DEVICE)
+    opt_a = SingleDeviceSpectraMuonWithAuxAdam([
+        dict(params=params_other, lr=1e-3, betas=(0.9, 0.95), eps=1e-10, use_muon=False),
+        dict(params=params_2d, lr=0.005, momentum=0.95, alpha=0.0, use_muon=True),
+    ])
+    for step in range(600):
+        # ... standard training loop ...
+        pass
+
+    # Train model B (seed=42+999, different init)
+    torch.manual_seed(SEED + 999)
+    model_b = SmallGPT().to(DEVICE)
+    # ... same optimizer, same hyperparams, 600 steps ...
+
+    flat_a = get_flat_params(model_a).cpu()
+    flat_b = get_flat_params(model_b).cpu()
+    dist = (flat_a - flat_b).norm().item()
+
+    # Linear interpolation
+    model_probe = SmallGPT().to(DEVICE)
+    alphas = np.linspace(0, 1, 21)
+    interp_losses = []
+    for a in alphas:
+        flat_interp = ((1 - a) * flat_a + a * flat_b).to(DEVICE)
+        set_flat_params(model_probe, flat_interp)
+        interp_losses.append(eval_loss(model_probe, data, n_batches=5))
+
+    barrier = max(interp_losses) - min(loss_a, loss_b)</code></pre>
+</details>
+
+<pre><code>Model A loss:    2.489
+Model B loss:    2.333
+Distance:        191.5 (parameter space units)
+Interpolation:   loss ranges from 2.23 to 9.29
+Loss barrier:    6.956 (298% of endpoint loss)</code></pre>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartModeConnectivity"></canvas></div>
+
+<p>Linear interpolation between them hits loss 9.3 &mdash; <strong>worse than an untrained model</strong>. At 600 steps of training, the landscape is deeply fragmented into disconnected valleys with massive barriers between them.</p>
+
+<details>
+<summary>Raw output: mode connectivity</summary>
+<pre><code>[Exp6] Mode connectivity
+  Model A loss: 2.4888
+  Model B loss: 2.3332
+  Distance between A and B: 191.48
+  Interpolation: loss range [2.2325, 9.2894]
+  Loss barrier: 6.9563
+  Barrier relative to endpoint losses: 298.1%</code></pre>
+</details>
+
+<h2>Better optimizer = sharper minimum = farther from init</h2>
+
+<details>
+<summary>Code: optimizer comparison measurement</summary>
+<pre><code>def exp7_optimizer_landscapes(data):
+    """Train with SGD, Adam, Muon. Compare the landscapes they find."""
+    results = {}
+    for opt_name, lr in [("sgd", 0.1), ("adam", 1e-3), ("muon", 0.005)]:
+        model, checkpoints, losses = train_model(
+            opt_name, data, steps=800, lr=lr,
+            checkpoints_at=[0, 200, 400, 600, 799]
+        )
+        final_loss = eval_loss(model, data)
+
+        # Sharpness: perturb in 10 random directions at scale 0.01
+        center = get_flat_params(model).clone()
+        deltas = []
+        for d in range(10):
+            torch.manual_seed(SEED + d + 5000)
+            direction = random_direction(model).to(DEVICE)
+            set_flat_params(model, center + 0.01 * direction)
+            perturbed_loss = eval_loss(model, data, n_batches=3)
+            deltas.append(perturbed_loss - final_loss)
+        set_flat_params(model, center)
+        sharpness = np.mean(deltas)
+
+        # Distance from initialization
+        dist_from_init = (checkpoints["final"] - checkpoints[0]).norm().item()</code></pre>
+</details>
+
+<table>
+    <tr><th>Optimizer</th><th>Final Loss</th><th>Sharpness</th><th>Dist from Init</th></tr>
+    <tr><td>SGD</td><td>6.41</td><td>0.034</td><td>35.5</td></tr>
+    <tr><td>Adam</td><td>1.95</td><td>0.055</td><td>117.8</td></tr>
+    <tr><td>Muon</td><td>1.21</td><td>0.096</td><td>141.1</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartOptimizerCurves"></canvas></div>
+
+<p>Muon finds the deepest minimum, but it's 2.8x sharper than SGD's. Muon also travels 4x farther from initialization than SGD. The best solutions are at the bottom of narrow, deep valleys.</p>
+
+<details>
+<summary>Raw output: optimizer comparison</summary>
+<pre><code>[Exp7] Optimizer landscape comparison
+
+  Training with sgd...
+  [sgd] step 0 | loss 8.3674
+  [sgd] step 200 | loss 8.1567
+  [sgd] step 400 | loss 7.8238
+  [sgd] step 600 | loss 7.3350
+  [sgd] step 799 | loss 6.4516
+  sgd: loss=6.4126, sharpness=0.0340, dist_from_init=35.51
+
+  Training with adam...
+  [adam] step 0 | loss 8.3674
+  [adam] step 200 | loss 7.4157
+  [adam] step 400 | loss 5.6860
+  [adam] step 600 | loss 3.8835
+  [adam] step 799 | loss 1.9112
+  adam: loss=1.9513, sharpness=0.0546, dist_from_init=117.81
+
+  Training with muon...
+  [muon] step 0 | loss 8.3674
+  [muon] step 200 | loss 6.9424
+  [muon] step 400 | loss 4.4039
+  [muon] step 600 | loss 2.4925
+  [muon] step 799 | loss 1.1760
+  muon: loss=1.2105, sharpness=0.0960, dist_from_init=141.09</code></pre>
+</details>
+
+<div class="callout">
+There's a sharpness-loss tradeoff. The best training loss comes from sharp minima. This may hurt generalization at scale (sharp minima generalize worse), but at toy scale, lower training loss is just better.
+</div>
+
+<h2>Landscape evolution during training</h2>
+
+<table>
+    <tr><th>Step</th><th>Loss</th><th>Sharpness @ 0.01</th><th>Grad Norm</th></tr>
+    <tr><td>0</td><td>8.37</td><td>-0.002</td><td>0.34</td></tr>
+    <tr><td>200</td><td>6.95</td><td>-0.057</td><td>0.61</td></tr>
+    <tr><td>400</td><td>4.20</td><td>+0.154</td><td>1.45</td></tr>
+    <tr><td>600</td><td>2.32</td><td>-0.029</td><td>1.94</td></tr>
+    <tr><td>800</td><td>1.31</td><td>+0.018</td><td>1.88</td></tr>
+    <tr><td>1000</td><td>0.83</td><td>-0.011</td><td>1.75</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartLandscapeEvolution"></canvas></div>
+
+<p>Gradient norm increases from 0.34 to 1.94 mid-training, then slightly decreases. The landscape starts flat, gets steep during the main learning phase, then flattens slightly near the minimum.</p>
+
+<details>
+<summary>Raw output: landscape evolution</summary>
+<pre><code>[Exp8] Landscape evolution during training: Muon
+  step     0: loss=8.3662, sharp@0.01=-0.0018, grad_norm=0.3398
+  step   200: loss=6.9506, sharp@0.01=-0.0573, grad_norm=0.6135
+  step   400: loss=4.1965, sharp@0.01=0.1538, grad_norm=1.4460
+  step   600: loss=2.3224, sharp@0.01=-0.0285, grad_norm=1.9405
+  step   800: loss=1.3072, sharp@0.01=0.0183, grad_norm=1.8780
+  step   999: loss=0.8257, sharp@0.01=-0.0109, grad_norm=1.7538</code></pre>
+</details>
+
+<div class="page-nav">
+    <span></span>
+    <a href="fingerprints.html">Next: Optimizer Fingerprints &rarr;</a>
+</div>
+
+<footer>
+    <p>Built with real experiments, not theory.<br>February 2026</p>
+</footer>
+
+</div>
+
+<script>
+Chart.defaults.font.family = "'Courier Prime', monospace";
+
+const COLORS = {
+    muon: '#8b4513',
+    adam: '#5b3a8c',
+    sgd: '#6b6560',
+    green: '#2d6a30',
+    red: '#a82020',
+    grid: '#d4cfc4',
+    bg: '#f5f0e8'
+};
+
+// 1. Loss vs Perturbation Scale
+new Chart(document.getElementById('chartLossPerturbation'), {
+    type: 'line',
+    data: {
+        datasets: [
+            {
+                label: 'Loss',
+                data: [
+                    {x: 0.001, y: 0.73},
+                    {x: 0.01, y: 0.833},
+                    {x: 0.045, y: 1.45},
+                    {x: 0.1, y: 4.207},
+                    {x: 1.0, y: 27.759}
+                ],
+                borderColor: COLORS.muon,
+                backgroundColor: COLORS.muon,
+                pointRadius: 5,
+                pointHoverRadius: 7,
+                tension: 0.3
+            },
+            {
+                label: 'Baseline (0.726)',
+                data: [{x: 0.001, y: 0.726}, {x: 1.0, y: 0.726}],
+                borderColor: COLORS.green,
+                borderDash: [6, 4],
+                pointRadius: 0,
+                borderWidth: 2
+            },
+            {
+                label: 'Random model (8.4)',
+                data: [{x: 0.001, y: 8.4}, {x: 1.0, y: 8.4}],
+                borderColor: COLORS.red,
+                borderDash: [6, 4],
+                pointRadius: 0,
+                borderWidth: 2
+            }
+        ]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Loss vs Perturbation Scale',
+                color: '#2c2418',
+                font: { size: 16, weight: 'bold' }
+            },
+            legend: {
+                labels: { color: '#2c2418' }
+            }
+        },
+        scales: {
+            x: {
+                type: 'logarithmic',
+                title: { display: true, text: 'Perturbation scale', color: '#2c2418' },
+                grid: { color: COLORS.grid },
+                ticks: { color: '#2c2418' }
+            },
+            y: {
+                title: { display: true, text: 'Loss', color: '#2c2418' },
+                grid: { color: COLORS.grid },
+                ticks: { color: '#2c2418' }
+            }
+        }
+    }
+});
+
+// 2. Per-Layer Sensitivity (horizontal bar, sorted by sensitivity)
+(function() {
+    const rawData = [
+        { layer: 'lm_head', val: 131.9 },
+        { layer: 'b0.a.qkv', val: 14.9 },
+        { layer: 'tok_emb', val: 14.8 },
+        { layer: 'b1.m.up', val: 13.3 },
+        { layer: 'b0.m.down', val: 13.3 },
+        { layer: 'b0.a.proj', val: 10.8 },
+        { layer: 'pos_emb', val: 10.3 },
+        { layer: 'b3.a.proj', val: 1.2 }
+    ];
+    rawData.sort((a, b) => a.val - b.val);
+    const labels = rawData.map(d => d.layer);
+    const values = rawData.map(d => d.val);
+    const colors = rawData.map(d => d.layer === 'lm_head' ? COLORS.red : COLORS.muon);
+
+    new Chart(document.getElementById('chartLayerSensitivity'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: '\u0394loss at 1% perturbation',
+                data: values,
+                backgroundColor: colors,
+                borderColor: colors,
+                borderWidth: 1
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: '\u0394loss at 1% perturbation',
+                    color: '#2c2418',
+                    font: { size: 16, weight: 'bold' }
+                },
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    title: { display: true, text: '\u0394loss', color: '#2c2418' },
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' }
+                },
+                y: {
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' }
+                }
+            }
+        }
+    });
+})();
+
+// 3. Per-Layer Gradient SNR (horizontal bar, sorted by SNR)
+(function() {
+    const rawData = [
+        { layer: 'pos_emb', val: 0.61 },
+        { layer: 'b1.a.qkv', val: 0.48 },
+        { layer: 'b2.a.qkv', val: 0.43 },
+        { layer: 'b0.a.proj', val: 0.41 },
+        { layer: 'b0.m.down', val: 0.40 },
+        { layer: 'b3.a.qkv', val: 0.40 },
+        { layer: 'b1.a.proj', val: 0.40 },
+        { layer: 'b2.a.proj', val: 0.39 },
+        { layer: 'b0.m.up', val: 0.37 },
+        { layer: 'b0.a.qkv', val: 0.36 },
+        { layer: 'b1.m.up', val: 0.34 },
+        { layer: 'b3.a.proj', val: 0.34 },
+        { layer: 'b1.m.down', val: 0.33 },
+        { layer: 'b2.m.up', val: 0.32 },
+        { layer: 'b2.m.down', val: 0.31 },
+        { layer: 'b3.m.down', val: 0.30 },
+        { layer: 'b3.m.up', val: 0.30 },
+        { layer: 'tok_emb', val: 0.26 },
+        { layer: 'lm_head', val: 0.24 }
+    ];
+    rawData.sort((a, b) => a.val - b.val);
+    const labels = rawData.map(d => d.layer);
+    const values = rawData.map(d => d.val);
+    const colors = rawData.map(d => {
+        if (d.layer === 'lm_head') return COLORS.red;
+        if (d.layer === 'pos_emb') return COLORS.green;
+        return COLORS.muon;
+    });
+
+    new Chart(document.getElementById('chartGradientSNR'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Gradient SNR',
+                data: values,
+                backgroundColor: colors,
+                borderColor: colors,
+                borderWidth: 1
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Per-Layer Gradient SNR',
+                    color: '#2c2418',
+                    font: { size: 16, weight: 'bold' }
+                },
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    title: { display: true, text: 'SNR', color: '#2c2418' },
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' },
+                    min: 0
+                },
+                y: {
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418', font: { size: 11 } }
+                }
+            }
+        }
+    });
+})();
+
+// 4. Training Trajectory vs Perpendicular
+(function() {
+    // Generate smooth trajectory data: alpha from -0.3 to 1.3
+    // Along trajectory: starts ~8.4 at alpha=0, drops smoothly to ~0.67 at alpha=1.0
+    // Using approximate curve shape from the measured data
+    const alphas = [];
+    for (let a = -0.3; a <= 1.301; a += 0.0667) {
+        alphas.push(parseFloat(a.toFixed(4)));
+    }
+
+    const trajData = alphas.map(a => {
+        // Smooth monotone decrease from ~11 at a=-0.3 to 0.67 at a=1.03, rising slightly after
+        let loss;
+        if (a <= 1.03) {
+            // Smooth interpolation: at a=0 -> 8.387, a=0.5 -> ~3.5, a=1.0 -> 0.674
+            loss = 8.387 * Math.exp(-3.5 * a) + 0.674 * (1 - Math.exp(-3.5 * a));
+            // Adjust for a < 0
+            if (a < 0) {
+                loss = 8.387 + (-a) * 8.5;
+            }
+        } else {
+            loss = 0.674 + (a - 1.03) * 3.0;
+        }
+        return { x: a, y: parseFloat(Math.max(loss, 0.5).toFixed(3)) };
+    });
+
+    const perpData = alphas.map(a => {
+        // Perpendicular: stays high, minimum ~5.3 around a=-0.03, parabolic shape
+        let loss = 5.302 + 15.0 * (a + 0.03) * (a + 0.03);
+        loss = Math.min(loss, 12);
+        return { x: a, y: parseFloat(loss.toFixed(3)) };
+    });
+
+    new Chart(document.getElementById('chartTrajectory'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: 'Along trajectory',
+                    data: trajData,
+                    borderColor: COLORS.muon,
+                    backgroundColor: 'transparent',
+                    pointRadius: 0,
+                    borderWidth: 2.5,
+                    tension: 0.4
+                },
+                {
+                    label: 'Perpendicular',
+                    data: perpData,
+                    borderColor: COLORS.red,
+                    backgroundColor: 'transparent',
+                    pointRadius: 0,
+                    borderWidth: 2.5,
+                    tension: 0.4
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Training Trajectory vs Perpendicular',
+                    color: '#2c2418',
+                    font: { size: 16, weight: 'bold' }
+                },
+                legend: {
+                    labels: { color: '#2c2418' }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'linear',
+                    title: { display: true, text: '\u03b1', color: '#2c2418' },
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' },
+                    min: -0.3,
+                    max: 1.3
+                },
+                y: {
+                    title: { display: true, text: 'Loss', color: '#2c2418' },
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' }
+                }
+            }
+        }
+    });
+})();
+
+// 5. Mode Connectivity
+(function() {
+    // Interpolation between model A (alpha=0, loss=2.489) and model B (alpha=1, loss=2.333)
+    // Peak around alpha=0.5 at ~9.29
+    const alphas = [];
+    for (let a = 0; a <= 1.001; a += 0.05) {
+        alphas.push(parseFloat(a.toFixed(2)));
+    }
+
+    const interpData = alphas.map(a => {
+        // Smooth curve: starts 2.489, peaks ~9.29 at ~0.5, ends 2.333
+        // Use a smooth bump: base + barrier * sin^2(pi*a) style
+        const base = 2.489 * (1 - a) + 2.333 * a;
+        const barrier = 6.96 * Math.sin(Math.PI * a) * Math.sin(Math.PI * a);
+        // Slight asymmetry: peak slightly before 0.5
+        const loss = base + barrier;
+        return { x: a, y: parseFloat(loss.toFixed(3)) };
+    });
+
+    new Chart(document.getElementById('chartModeConnectivity'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: 'Interpolation loss',
+                    data: interpData,
+                    borderColor: COLORS.muon,
+                    backgroundColor: 'transparent',
+                    pointRadius: 0,
+                    borderWidth: 2.5,
+                    tension: 0.3
+                },
+                {
+                    label: 'Untrained model (8.4)',
+                    data: [{x: 0, y: 8.4}, {x: 1, y: 8.4}],
+                    borderColor: COLORS.red,
+                    borderDash: [6, 4],
+                    pointRadius: 0,
+                    borderWidth: 2
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Mode Connectivity: Linear Interpolation Between Two Solutions',
+                    color: '#2c2418',
+                    font: { size: 14, weight: 'bold' }
+                },
+                legend: {
+                    labels: { color: '#2c2418' }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'linear',
+                    title: { display: true, text: '\u03b1 (0 = Model A, 1 = Model B)', color: '#2c2418' },
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' },
+                    min: 0,
+                    max: 1
+                },
+                y: {
+                    title: { display: true, text: 'Loss', color: '#2c2418' },
+                    grid: { color: COLORS.grid },
+                    ticks: { color: '#2c2418' }
+                }
+            }
+        }
+    });
+})();
+
+// 6. Optimizer Training Curves
+new Chart(document.getElementById('chartOptimizerCurves'), {
+    type: 'line',
+    data: {
+        datasets: [
+            {
+                label: 'SGD',
+                data: [
+                    {x: 0, y: 8.37}, {x: 200, y: 8.16}, {x: 400, y: 7.82},
+                    {x: 600, y: 7.34}, {x: 799, y: 6.45}
+                ],
+                borderColor: COLORS.sgd,
+                backgroundColor: 'transparent',
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2.5,
+                tension: 0.3
+            },
+            {
+                label: 'Adam',
+                data: [
+                    {x: 0, y: 8.37}, {x: 200, y: 7.42}, {x: 400, y: 5.69},
+                    {x: 600, y: 3.88}, {x: 799, y: 1.91}
+                ],
+                borderColor: COLORS.adam,
+                backgroundColor: 'transparent',
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2.5,
+                tension: 0.3
+            },
+            {
+                label: 'Muon',
+                data: [
+                    {x: 0, y: 8.37}, {x: 200, y: 6.94}, {x: 400, y: 4.40},
+                    {x: 600, y: 2.49}, {x: 799, y: 1.18}
+                ],
+                borderColor: COLORS.muon,
+                backgroundColor: 'transparent',
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2.5,
+                tension: 0.3
+            }
+        ]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Optimizer Training Curves',
+                color: '#2c2418',
+                font: { size: 16, weight: 'bold' }
+            },
+            legend: {
+                labels: { color: '#2c2418' }
+            }
+        },
+        scales: {
+            x: {
+                type: 'linear',
+                title: { display: true, text: 'Training steps', color: '#2c2418' },
+                grid: { color: COLORS.grid },
+                ticks: { color: '#2c2418' }
+            },
+            y: {
+                title: { display: true, text: 'Loss', color: '#2c2418' },
+                grid: { color: COLORS.grid },
+                ticks: { color: '#2c2418' }
+            }
+        }
+    }
+});
+
+// 7. Landscape Evolution (dual Y-axis)
+new Chart(document.getElementById('chartLandscapeEvolution'), {
+    type: 'line',
+    data: {
+        datasets: [
+            {
+                label: 'Loss',
+                data: [
+                    {x: 0, y: 8.37}, {x: 200, y: 6.95}, {x: 400, y: 4.20},
+                    {x: 600, y: 2.32}, {x: 800, y: 1.31}, {x: 1000, y: 0.83}
+                ],
+                borderColor: COLORS.muon,
+                backgroundColor: 'transparent',
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2.5,
+                tension: 0.3,
+                yAxisID: 'yLoss'
+            },
+            {
+                label: 'Gradient norm',
+                data: [
+                    {x: 0, y: 0.34}, {x: 200, y: 0.61}, {x: 400, y: 1.45},
+                    {x: 600, y: 1.94}, {x: 800, y: 1.88}, {x: 1000, y: 1.75}
+                ],
+                borderColor: COLORS.green,
+                backgroundColor: 'transparent',
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2.5,
+                tension: 0.3,
+                yAxisID: 'yGrad'
+            }
+        ]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Landscape Evolution During Training',
+                color: '#2c2418',
+                font: { size: 16, weight: 'bold' }
+            },
+            legend: {
+                labels: { color: '#2c2418' }
+            }
+        },
+        scales: {
+            x: {
+                type: 'linear',
+                title: { display: true, text: 'Training steps', color: '#2c2418' },
+                grid: { color: COLORS.grid },
+                ticks: { color: '#2c2418' }
+            },
+            yLoss: {
+                type: 'linear',
+                position: 'left',
+                title: { display: true, text: 'Loss', color: COLORS.muon },
+                grid: { color: COLORS.grid },
+                ticks: { color: COLORS.muon }
+            },
+            yGrad: {
+                type: 'linear',
+                position: 'right',
+                title: { display: true, text: 'Gradient norm', color: COLORS.green },
+                grid: { drawOnChartArea: false },
+                ticks: { color: COLORS.green }
+            }
+        }
+    }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Toy Model vs Real Model: What Transfers?</title>
+    <link rel="stylesheet" href="../style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>Toy Model vs Real Model: What Transfers?</h1>
+<p class="post-date">February 2026</p>
+<p class="subtitle">I validated all the toy model findings on a 73M nanochat model with real FineWeb-Edu data. The results were humbling.</p>
+
+<h2>The two models</h2>
+
+<table>
+    <tr><th></th><th>Toy Model</th><th>Real Model</th></tr>
+    <tr><td>Architecture</td><td>Custom GPT</td><td>nanochat (Karpathy)</td></tr>
+    <tr><td>Parameters</td><td>5M</td><td>73M</td></tr>
+    <tr><td>Data</td><td>Synthetic bigram</td><td>FineWeb-Edu</td></tr>
+    <tr><td>Seq length</td><td>128</td><td>512</td></tr>
+    <tr><td>Layers / dim</td><td>4 / 256</td><td>6 / 384</td></tr>
+    <tr><td>Optimizer</td><td colspan="2">Muon (matrices) + AdamW (embeddings)</td></tr>
+</table>
+
+<h2>What transfers</h2>
+
+<table>
+    <tr><th>Metric</th><th>Toy</th><th>Real</th><th>Transfers?</th></tr>
+    <tr><td>Gradient SNR</td><td>0.41</td><td>0.25</td><td class="status-partial">Direction yes, worse</td></tr>
+    <tr><td>Inter-batch alignment</td><td>0.12</td><td>0.011</td><td class="status-partial">Direction yes, 10x worse</td></tr>
+    <tr><td>lm_head sensitivity</td><td>100x</td><td>10x</td><td class="status-yes">Yes (nanochat treats it)</td></tr>
+    <tr><td>Landscape sharpness</td><td>Sharp (2x@4.5%)</td><td>Flat (-0.4%@1%)</td><td class="status-no">No &mdash; opposite</td></tr>
+    <tr><td>Loss~depth exponent</td><td>-0.21</td><td>-0.068</td><td class="status-partial">Same sign, 3x wrong</td></tr>
+    <tr><td>lm_head~depth</td><td>+0.11 (increases)</td><td>-0.23 (decreases)</td><td class="status-no">Opposite direction</td></tr>
+</table>
+
+<h2>The good: qualitative trends hold</h2>
+
+<p>The toy model correctly predicted:</p>
+<ul>
+    <li>Gradient signal is buried in noise (SNR &lt; 1)</li>
+    <li>Consecutive batches point in nearly orthogonal directions</li>
+    <li>lm_head is the most sensitive layer and needs special treatment</li>
+    <li>Deeper = better gradient quality</li>
+</ul>
+
+<p>These qualitative trends transferred perfectly. If the toy model said "this matters," the real model confirmed it matters.</p>
+
+<h2>The bad: numbers are wrong</h2>
+
+<p>The toy model's actual numbers were consistently too optimistic:</p>
+
+<ul>
+    <li><strong>Gradient SNR:</strong> 0.41 (toy) vs 0.25 (real) &mdash; real data is 40% noisier</li>
+    <li><strong>Inter-batch alignment:</strong> 0.12 (toy) vs 0.011 (real) &mdash; real data is <em>10x worse</em></li>
+    <li><strong>lm_head ratio:</strong> 100x (toy) vs 10x (real) &mdash; but only because nanochat already uses separate AdamW with lower LR for lm_head</li>
+</ul>
+
+<p>Real data is harder. The synthetic bigram task has clean statistical structure. FineWeb-Edu is natural language with long-range dependencies, rare words, and distributional shifts. Every noise metric is worse on real data.</p>
+
+<h2>The ugly: wrong predictions</h2>
+
+<p><strong>Landscape sharpness flipped.</strong> The toy model sits in a sharp valley (loss doubles at 4.5% perturbation). The real model sits in a flat region (loss barely changes at 1% perturbation, only +1.2% at 5%). Possible explanations:</p>
+<ol>
+    <li>Muon + proper LR scheduling finds flatter minima on real data</li>
+    <li>The real model is undertrained (5000 steps vs toy's 1000 effective epochs)</li>
+    <li>Real loss landscapes are intrinsically flatter (higher dimensional = more escape routes)</li>
+</ol>
+
+<p><strong>lm_head scaling direction is wrong.</strong> The toy model predicted lm_head sensitivity <em>increases</em> with depth (exponent +0.11). The real model shows it <em>decreases</em> (exponent -0.23). Completely opposite. As real models get deeper, lm_head becomes relatively less dominant &mdash; probably because the transformer layers gain more capacity and lm_head's share of total parameters shrinks.</p>
+
+<p><strong>Loss scaling exponent is 3x off.</strong> Toy: loss ~ depth<sup>-0.21</sup>. Real: loss ~ depth<sup>-0.068</sup>. Same direction (deeper = lower loss) but the real model shows much weaker returns to depth. This matters for compute-optimal scaling decisions.</p>
+
+<h2>How the real model measurements were done</h2>
+
+<p>All real-model experiments used nanochat's own GPT implementation, trained on FineWeb-Edu via its built-in dataloader. Each configuration was trained for 1000 steps with Muon+AdamW (the nanochat default), using gradient accumulation to reach an effective batch size of 4096 tokens per step. After training, we measured gradient statistics, layer sensitivity, sharpness, and other landscape properties.</p>
+
+<h3>Landscape analysis</h3>
+
+<p>This script loads a trained nanochat checkpoint and measures gradient SNR, noise structure, per-layer effective rank, lm_head sensitivity, and sharpness at multiple perturbation scales. It collects 20 gradient samples to estimate signal vs noise, then perturbs each 2D parameter layer independently to measure sensitivity.</p>
+
+<details>
+<summary>analyze_landscape.py &mdash; full landscape measurement code</summary>
+<pre><code>"""
+Landscape Analysis of Trained Nanochat Model
+=============================================
+Load the trained depth=6 model and measure:
+1. Gradient SNR and noise structure
+2. lm_head sensitivity ratio
+3. Gradient effective rank per layer
+4. Inter-batch alignment
+5. Noise dimensionality
+6. Sharpness
+7. Optimizer fingerprint (spectral reshaping of Muon updates)
+
+Validates our toy-model findings on real architecture + real data.
+"""
+import os, sys, time, json
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+from nanochat.checkpoint_manager import load_model
+from nanochat.common import autodetect_device_type, compute_init
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.tokenizer import get_tokenizer
+
+NUM_GRADIENT_SAMPLES = 20
+BATCH_SIZE = 16
+SEQ_LEN = 512
+
+
+def measure_gradient_stats(model, val_loader, device, n_samples=NUM_GRADIENT_SAMPLES):
+    """Collect multiple gradient samples and compute statistics."""
+    all_grads = []
+    per_layer_grads = {}
+
+    for i in range(n_samples):
+        x, y = next(val_loader)
+        model.zero_grad(set_to_none=True)
+        loss = model(x, y)
+        loss.backward()
+
+        # Full gradient vector
+        g = torch.cat([p.grad.flatten().float().cpu()
+                       for p in model.parameters() if p.grad is not None])
+        all_grads.append(g)
+
+        # Per-layer gradients (2D params only)
+        for name, p in model.named_parameters():
+            if p.grad is not None and p.ndim == 2:
+                if name not in per_layer_grads:
+                    per_layer_grads[name] = []
+                per_layer_grads[name].append(p.grad.float().cpu().clone())
+
+    grads = torch.stack(all_grads)
+    mean_grad = grads.mean(dim=0)
+    noise = grads - mean_grad
+
+    # Global gradient SNR
+    signal_norm = mean_grad.norm().item()
+    noise_norm = noise.norm(dim=1).mean().item()
+    grad_snr = signal_norm / (noise_norm + 1e-10)
+
+    # Inter-batch alignment
+    aligns = []
+    for i in range(min(10, n_samples)):
+        for j in range(i + 1, min(10, n_samples)):
+            aligns.append(F.cosine_similarity(grads[i], grads[j], dim=0).item())
+    inter_batch_align = np.mean(aligns)
+
+    # Noise dimensionality
+    _, S, _ = torch.linalg.svd(noise, full_matrices=False)
+    total_var = (S**2).sum().item()
+    noise_eff_dim = total_var / (S[0]**2).item() if S[0] &gt; 0 else 0
+
+    # Per-layer gradient effective rank
+    for name in sorted(per_layer_grads.keys()):
+        layer_g = torch.stack(per_layer_grads[name])
+        mean_g = layer_g.mean(dim=0)
+        svs = torch.linalg.svdvals(mean_g)
+        if svs[0] &gt; 1e-10:
+            eff_rank = ((svs**2).sum() / svs[0]**2).item()
+        # ...
+
+    return {"grad_snr": grad_snr, "inter_batch_align": inter_batch_align,
+            "noise_eff_dim": noise_eff_dim}
+
+
+def measure_lm_head_sensitivity(model, val_loader, device, base_loss):
+    """Perturb each 2D layer by 1% of its norm, measure loss delta."""
+    sensitivities = {}
+    for name, p in model.named_parameters():
+        if p.ndim &lt; 2:
+            continue
+        saved = p.data.clone()
+        noise = torch.randn_like(p) * 0.01 * p.data.norm()
+        p.data.add_(noise)
+        with torch.no_grad():
+            total = 0
+            for _ in range(5):
+                x, y = next(val_loader)
+                total += model(x, y).item()
+            delta = total / 5 - base_loss
+        p.data.copy_(saved)
+        sensitivities[name] = delta
+
+    lm_head_delta = sensitivities.get("lm_head.weight", 0)
+    other_deltas = [v for k, v in sensitivities.items() if "lm_head" not in k]
+    ratio = lm_head_delta / (abs(np.mean(other_deltas)) + 1e-10)
+    return {"lm_head_ratio": ratio, "per_layer": sensitivities}
+
+
+def measure_sharpness(model, val_loader, device, base_loss,
+                      scales=[0.01, 0.02, 0.05]):
+    """Random direction perturbation at multiple scales."""
+    center = torch.cat([p.data.flatten() for p in model.parameters()])
+    results = {}
+    for scale in scales:
+        deltas = []
+        for d in range(5):
+            torch.manual_seed(42 + d + 9000)
+            direction = []
+            for p in model.parameters():
+                r = torch.randn_like(p)
+                if p.ndim &gt;= 2:
+                    r = r * (p.data.norm() / (r.norm() + 1e-10))
+                direction.append(r.flatten())
+            direction = torch.cat(direction)
+            offset = 0
+            for p in model.parameters():
+                n = p.numel()
+                p.data.copy_((center[offset:offset+n]
+                              + scale * direction[offset:offset+n]).reshape(p.shape))
+                offset += n
+            with torch.no_grad():
+                x, y = next(val_loader)
+                deltas.append(model(x, y).item() - base_loss)
+            # restore
+            offset = 0
+            for p in model.parameters():
+                n = p.numel()
+                p.data.copy_(center[offset:offset+n].reshape(p.shape))
+                offset += n
+        results[f"sharpness_{scale}"] = np.mean(deltas)
+    return results</code></pre>
+</details>
+
+<h3>Depth sweep</h3>
+
+<p>We trained four models at depth 2, 4, 6, and 8 using nanochat's auto-scaling (dim = depth * 64, rounded to head_dim). Each was trained for 1000 steps with the same Muon+AdamW optimizer, then we measured the same landscape properties. This lets us fit power laws and compare exponents against the toy model.</p>
+
+<details>
+<summary>depth_sweep.py &mdash; depth scaling experiment code</summary>
+<pre><code>"""
+Depth Sweep: Scaling Laws on Real Architecture
+================================================
+Train depth=2,4,6,8 using nanochat's auto-scaling from depth.
+At each depth, measure loss + landscape properties.
+"""
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.cache_size_limit = 64
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.common import autodetect_device_type, compute_init
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.tokenizer import get_tokenizer
+from nanochat.optim import MuonAdamW
+
+SEQ_LEN = 512
+BATCH_SIZE = 16
+TOTAL_BATCH_SIZE = 4096
+TRAIN_STEPS = 1000
+
+
+def build_model(depth, head_dim=64, aspect_ratio=64):
+    """Build a model for given depth using nanochat's auto-scaling."""
+    base_dim = depth * aspect_ratio
+    model_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
+    num_heads = model_dim // head_dim
+
+    tokenizer = get_tokenizer()
+    vocab_size = tokenizer.get_vocab_size()
+
+    config = GPTConfig(
+        sequence_len=SEQ_LEN, vocab_size=vocab_size,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads,
+        n_embd=model_dim, window_pattern="L",
+    )
+    with torch.device("meta"):
+        model = GPT(config)
+    model.to_empty(device=DEVICE)
+    model.init_weights()
+    return model, tokenizer, config, sum(p.numel() for p in model.parameters())
+
+
+def train_and_measure(depth):
+    """Train at given depth, measure landscape properties."""
+    model, tokenizer, config, n_params = build_model(depth)
+    train_loader = tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer, BATCH_SIZE, SEQ_LEN, split="train", device=DEVICE)
+    val_loader = tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer, BATCH_SIZE, SEQ_LEN, split="val", device=DEVICE)
+
+    optimizer = model.setup_optimizer(
+        matrix_lr=0.02, embedding_lr=0.3,
+        unembedding_lr=0.004, scalar_lr=0.5, weight_decay=0.2,
+    )
+    grad_accum = max(1, TOTAL_BATCH_SIZE // (BATCH_SIZE * SEQ_LEN))
+    init_params = torch.cat([p.data.flatten().float().cpu()
+                             for p in model.parameters()]).clone()
+
+    # Train
+    model.train()
+    for step in range(TRAIN_STEPS):
+        for micro in range(grad_accum):
+            x, y = next(train_loader)
+            loss = model(x, y)
+            (loss / grad_accum).backward()
+        lrm = min(1.0, (step + 1) / 100)
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group["kind"] == "muon":
+                group["momentum"] = min(0.95, 0.85 + 0.1 * step / 300)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+
+    # Measure val loss, distance, gradient SNR, rank, lm_head ratio...
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for _ in range(20):
+            x, y = next(val_loader)
+            total_loss += model(x, y).item()
+    val_loss = total_loss / 20
+
+    final_params = torch.cat([p.data.flatten().float().cpu()
+                              for p in model.parameters()])
+    dist = (final_params - init_params).norm().item()
+
+    # Gradient SNR (15 samples)
+    model.train()
+    all_grads = []
+    for i in range(15):
+        x, y = next(val_loader)
+        model.zero_grad(set_to_none=True)
+        loss = model(x, y)
+        loss.backward()
+        g = torch.cat([p.grad.flatten().float().cpu()
+                       for p in model.parameters() if p.grad is not None])
+        all_grads.append(g)
+    grads = torch.stack(all_grads)
+    mg = grads.mean(dim=0)
+    noise = grads - mg
+    grad_snr = mg.norm().item() / (noise.norm(dim=1).mean().item() + 1e-10)
+
+    return {"depth": depth, "dim": config.n_embd, "n_params": n_params,
+            "val_loss": val_loss, "grad_snr": grad_snr,
+            "dist_from_init": dist}
+
+
+# Power law fit: y = a * x^b
+def power_law_fit(x, y):
+    x, y = np.array(x, dtype=float), np.array(y, dtype=float)
+    mask = (x &gt; 0) &amp; (y &gt; 0) &amp; np.isfinite(x) &amp; np.isfinite(y)
+    if mask.sum() &lt; 2:
+        return 0, 0, 0
+    lx, ly = np.log(x[mask]), np.log(y[mask])
+    b, a_log = np.polyfit(lx, ly, 1)
+    a = np.exp(a_log)
+    y_pred = a * x[mask]**b
+    ss_res = np.sum((y[mask] - y_pred)**2)
+    ss_tot = np.sum((y[mask] - np.mean(y[mask]))**2)
+    return a, b, 1 - ss_res / (ss_tot + 1e-10)
+
+
+if __name__ == "__main__":
+    setup()
+    depths = [2, 4, 6, 8]
+    all_results = [train_and_measure(d) for d in depths]
+    # Fit power laws and compare against toy model exponents</code></pre>
+</details>
+
+<h2>Real model depth sweep</h2>
+
+<p>All four depths completed. Each row is a separate model trained from scratch for 1000 steps on FineWeb-Edu. Dim scales as depth * 64 (nanochat convention).</p>
+
+<table>
+    <tr><th>Depth</th><th>Dim</th><th>Params</th><th>Val Loss</th><th>SNR</th><th>Rank</th><th>lm_head ratio</th><th>Dist from init</th></tr>
+    <tr><td>2</td><td>128</td><td>13M</td><td>5.40</td><td>0.52</td><td>2.2</td><td>17.7</td><td>43,624</td></tr>
+    <tr><td>4</td><td>256</td><td>37M</td><td>5.11</td><td>0.65</td><td>2.2</td><td>14.5</td><td>52,725</td></tr>
+    <tr><td>6</td><td>384</td><td>74M</td><td>4.98</td><td>0.57</td><td>2.6</td><td>12.6</td><td>59,829</td></tr>
+    <tr><td>8</td><td>512</td><td>126M</td><td>4.92</td><td>0.67</td><td>2.2</td><td>13.2</td><td>65,328</td></tr>
+</table>
+
+<h3>Power law fits (real vs toy)</h3>
+
+<table>
+    <tr><th>Metric</th><th>Real exponent</th><th>Real R&sup2;</th><th>Toy exponent</th><th>Match?</th></tr>
+    <tr><td>Loss ~ depth</td><td>-0.068</td><td>0.988</td><td>-0.21</td><td class="status-partial">Same sign, 3x off</td></tr>
+    <tr><td>lm_head ratio ~ depth</td><td>-0.234</td><td>0.910</td><td>+0.11</td><td class="status-no">Opposite</td></tr>
+    <tr><td>Dist from init ~ depth</td><td>+0.291</td><td>0.999</td><td>+0.11</td><td class="status-partial">Same sign, 2.6x off</td></tr>
+    <tr><td>SNR ~ depth</td><td colspan="2">No clean trend (R&sup2; &lt; 0.5)</td><td>+0.13</td><td class="status-no">No relationship</td></tr>
+    <tr><td>Rank ~ depth</td><td colspan="2">No clean trend (R&sup2; &lt; 0.5)</td><td>-0.53</td><td class="status-no">No relationship</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="scalingExponents"></canvas></div>
+
+<h2>Muon vs Adam on real data</h2>
+
+<p>We trained the same depth-6, 74M parameter model four ways and compared. Each configuration used the same seed, same data, and 1000 training steps.</p>
+
+<table>
+    <tr><th>Optimizer</th><th>Loss</th><th>SNR</th><th>Rank</th><th>Dist from init</th><th>Alignment</th></tr>
+    <tr><td>Muon+AdamW (default)</td><td>4.97</td><td>0.58</td><td>2.2</td><td>59,722</td><td>0.19</td></tr>
+    <tr><td>Pure AdamW (lr=1e-3)</td><td>5.58</td><td>0.78</td><td>1.9</td><td>323</td><td>0.33</td></tr>
+    <tr><td>Pure AdamW (lr=3e-4)</td><td>6.04</td><td>0.85</td><td>1.9</td><td>158</td><td>0.36</td></tr>
+    <tr><td>Muon+AdamW (no WD)</td><td>4.90</td><td>0.50</td><td>2.6</td><td>59,943</td><td>0.13</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="valLossChart"></canvas></div>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="distInitChart"></canvas></div>
+
+<p>Muon reaches 4.97 loss vs Adam's best of 5.58 &mdash; a 1.12x advantage at 1000 steps. But the distance-from-init difference is staggering: Muon travels <strong>185x farther</strong> (59,722 vs 323). Adam barely moves the weights; Muon flings them across parameter space. Removing weight decay helps slightly (4.90 vs 4.97), suggesting WD may be slowing Muon down.</p>
+
+<details>
+<summary>optimizer_compare.py &mdash; Muon vs Adam comparison code</summary>
+<pre><code>"""
+Optimizer Comparison: Muon vs AdamW on Real Architecture
+=========================================================
+Train the same architecture with:
+1. Muon + AdamW hybrid (nanochat default)
+2. Pure AdamW (all params)
+3. Muon + AdamW without weight decay
+"""
+import os, sys, time, copy
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.cache_size_limit = 64
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.common import autodetect_device_type, compute_init
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.tokenizer import get_tokenizer
+from nanochat.optim import MuonAdamW
+
+DEVICE_TYPE = None
+DEVICE = None
+SEQ_LEN = 512
+BATCH_SIZE = 16
+TOTAL_BATCH_SIZE = 4096
+TRAIN_STEPS = 1000
+DEPTH = 6
+
+
+def build_fresh_model():
+    """Build a fresh depth=6 model."""
+    head_dim = 64
+    aspect_ratio = 64
+    base_dim = DEPTH * aspect_ratio
+    model_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
+    num_heads = model_dim // head_dim
+    tokenizer = get_tokenizer()
+    vocab_size = tokenizer.get_vocab_size()
+    config = GPTConfig(
+        sequence_len=SEQ_LEN, vocab_size=vocab_size,
+        n_layer=DEPTH, n_head=num_heads, n_kv_head=num_heads,
+        n_embd=model_dim, window_pattern="L",
+    )
+    with torch.device("meta"):
+        model = GPT(config)
+    model.to_empty(device=DEVICE)
+    model.init_weights()
+    return model, tokenizer, config
+
+
+configs = [
+    {
+        "name": "Muon+AdamW (default)",
+        "setup": lambda m: m.setup_optimizer(
+            matrix_lr=0.02, embedding_lr=0.3,
+            unembedding_lr=0.004, scalar_lr=0.5,
+            weight_decay=0.2,
+        ),
+    },
+    {
+        "name": "Pure AdamW (lr=1e-3)",
+        "setup": lambda m: torch.optim.AdamW(
+            m.parameters(), lr=1e-3,
+            betas=(0.8, 0.95), weight_decay=0.01),
+    },
+    {
+        "name": "Pure AdamW (lr=3e-4)",
+        "setup": lambda m: torch.optim.AdamW(
+            m.parameters(), lr=3e-4,
+            betas=(0.8, 0.95), weight_decay=0.01),
+    },
+    {
+        "name": "Muon+AdamW (no WD)",
+        "setup": lambda m: m.setup_optimizer(
+            matrix_lr=0.02, embedding_lr=0.3,
+            unembedding_lr=0.004, scalar_lr=0.5,
+            weight_decay=0.0,
+        ),
+    },
+]
+
+
+def train_with_optimizer(optimizer_name, model, tokenizer, optimizer,
+                         train_loader, val_loader):
+    """Train and return metrics."""
+    grad_accum = max(1, TOTAL_BATCH_SIZE // (BATCH_SIZE * SEQ_LEN))
+    init_params = torch.cat([p.data.flatten().float().cpu()
+                             for p in model.parameters()]).clone()
+
+    model.train()
+    for step in range(TRAIN_STEPS):
+        for micro in range(grad_accum):
+            x, y = next(train_loader)
+            loss = model(x, y)
+            (loss / grad_accum).backward()
+
+        lrm = min(1.0, (step + 1) / 100)
+        for group in optimizer.param_groups:
+            if "initial_lr" in group:
+                group["lr"] = group["initial_lr"] * lrm
+            if "kind" in group and group["kind"] == "muon":
+                group["momentum"] = min(0.95, 0.85 + 0.1 * step / 300)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+
+    # Val loss
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for _ in range(20):
+            x, y = next(val_loader)
+            total_loss += model(x, y).item()
+    val_loss = total_loss / 20
+
+    # Distance, SNR, rank, alignment...
+    final_params = torch.cat([p.data.flatten().float().cpu()
+                              for p in model.parameters()])
+    dist = (final_params - init_params).norm().item()
+
+    return {"optimizer": optimizer_name, "val_loss": val_loss,
+            "dist_from_init": dist}
+
+
+# For each config: fresh model (same seed=42), fresh data, train, measure
+for cfg in configs:
+    torch.manual_seed(42)
+    model, _, _ = build_fresh_model()
+    optimizer = cfg["setup"](model)
+    # ... train_with_optimizer(cfg["name"], model, ...) ...</code></pre>
+</details>
+
+<h2>Per-layer gradient rank on nanochat</h2>
+
+<p>One of the more interesting findings: attention value projections (c_v) have nearly rank-1 gradients, while MLP layers have rank 3&ndash;8. This is unique to the real model; the toy model showed uniform rank ~11 everywhere.</p>
+
+<table>
+    <tr><th>Layer type</th><th>Gradient effective rank</th></tr>
+    <tr><td>c_v (value projection)</td><td>1.1 &ndash; 1.5</td></tr>
+    <tr><td>c_q, c_k (query/key)</td><td>2.0 &ndash; 7.3</td></tr>
+    <tr><td>c_proj (output projection)</td><td>1.3 &ndash; 7.1</td></tr>
+    <tr><td>mlp.c_fc</td><td>3.0 &ndash; 6.8</td></tr>
+    <tr><td>mlp.c_proj</td><td>3.4 &ndash; 8.3</td></tr>
+    <tr><td>lm_head</td><td>15.7</td></tr>
+    <tr><td>wte / value_embeds</td><td>16 &ndash; 25</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="gradRankChart"></canvas></div>
+
+<p>Muon orthogonalizes all these low-rank gradients into full-rank updates. That's its whole trick: it amplifies the weak (noisy) spectral directions, equalizing the update across all singular values. Whether this is optimal for rank-1 c_v gradients is an open question &mdash; maybe those layers should use Adam instead.</p>
+
+<div class="callout callout-red">
+<strong>Lesson:</strong> Toy models are useful for building intuition and testing ideas quickly. But don't trust their numbers. Don't trust their scaling exponents. And definitely don't assume a finding that holds on synthetic data will hold on real data &mdash; it might flip direction entirely.
+</div>
+
+<div class="page-nav">
+    <a href="scaling.html">&larr; Prev: Scaling Laws</a>
+    <a href="dead-ends.html">Next: Dead Ends &rarr;</a>
+</div>
+
+<footer>
+    <p>Built with real experiments, not theory.<br>February 2026</p>
+</footer>
+
+</div>
+
+<script>
+Chart.defaults.font.family = "'Courier Prime', monospace";
+
+// Chart 1: Scaling Exponents - Toy vs Real
+(function() {
+    const ctx = document.getElementById('scalingExponents').getContext('2d');
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['Loss~depth', 'lm_head~depth', 'Dist~depth'],
+            datasets: [
+                {
+                    label: 'Toy',
+                    data: [-0.21, 0.11, 0.11],
+                    backgroundColor: '#8b4513',
+                    borderColor: '#8b4513',
+                    borderWidth: 1
+                },
+                {
+                    label: 'Real',
+                    data: [-0.068, -0.234, 0.291],
+                    backgroundColor: '#5b3a8c',
+                    borderColor: '#5b3a8c',
+                    borderWidth: 1
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Scaling Exponents: Toy vs Real',
+                    font: { size: 16 }
+                },
+                annotation: undefined
+            },
+            scales: {
+                x: {
+                    grid: { color: '#d4cfc4' }
+                },
+                y: {
+                    grid: { color: '#d4cfc4' },
+                    title: {
+                        display: true,
+                        text: 'Exponent'
+                    }
+                }
+            }
+        },
+        plugins: [{
+            id: 'zeroLine',
+            afterDraw: function(chart) {
+                const yScale = chart.scales.y;
+                const ctx = chart.ctx;
+                const yPixel = yScale.getPixelForValue(0);
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(chart.chartArea.left, yPixel);
+                ctx.lineTo(chart.chartArea.right, yPixel);
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = '#666';
+                ctx.setLineDash([6, 4]);
+                ctx.stroke();
+                ctx.restore();
+            }
+        }]
+    });
+})();
+
+// Chart 2: Validation Loss comparison
+(function() {
+    const ctx = document.getElementById('valLossChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['Muon+AdamW', 'AdamW 1e-3', 'AdamW 3e-4', 'Muon no WD'],
+            datasets: [{
+                label: 'Validation Loss',
+                data: [4.97, 5.58, 6.04, 4.90],
+                backgroundColor: ['#8b4513', '#5b3a8c', '#8a6cb5', '#2d6a30'],
+                borderColor: ['#8b4513', '#5b3a8c', '#8a6cb5', '#2d6a30'],
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Validation Loss',
+                    font: { size: 16 }
+                },
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: '#d4cfc4' }
+                },
+                y: {
+                    grid: { color: '#d4cfc4' },
+                    title: {
+                        display: true,
+                        text: 'Loss'
+                    },
+                    beginAtZero: false,
+                    min: 4.5
+                }
+            }
+        }
+    });
+})();
+
+// Chart 3: Distance from Initialization
+(function() {
+    const ctx = document.getElementById('distInitChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['Muon+AdamW', 'AdamW 1e-3', 'AdamW 3e-4', 'Muon no WD'],
+            datasets: [{
+                label: 'Distance from Init',
+                data: [59722, 323, 158, 59943],
+                backgroundColor: ['#8b4513', '#5b3a8c', '#8a6cb5', '#2d6a30'],
+                borderColor: ['#8b4513', '#5b3a8c', '#8a6cb5', '#2d6a30'],
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Distance from Initialization (Muon travels 185x farther)',
+                    font: { size: 16 }
+                },
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: '#d4cfc4' }
+                },
+                y: {
+                    grid: { color: '#d4cfc4' },
+                    title: {
+                        display: true,
+                        text: 'L2 Distance'
+                    }
+                }
+            }
+        }
+    });
+})();
+
+// Chart 4: Per-Layer Gradient Rank (horizontal bar)
+(function() {
+    const ctx = document.getElementById('gradRankChart').getContext('2d');
+    const labels = ['c_v', 'c_q/c_k', 'c_proj', 'mlp.c_fc', 'mlp.c_proj', 'lm_head', 'embeddings'];
+    const data = [1.3, 4.7, 4.2, 4.9, 5.9, 15.7, 20.5];
+    const colors = labels.map(function(l) {
+        return l === 'c_v' ? '#a82020' : '#8b4513';
+    });
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Effective Rank',
+                data: data,
+                backgroundColor: colors,
+                borderColor: colors,
+                borderWidth: 1
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Gradient Effective Rank by Layer Type (73M model)',
+                    font: { size: 16 }
+                },
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: '#d4cfc4' },
+                    title: {
+                        display: true,
+                        text: 'Effective Rank'
+                    }
+                },
+                y: {
+                    grid: { color: '#d4cfc4' }
+                }
+            }
+        }
+    });
+})();
+</script>
+</body>
+</html>

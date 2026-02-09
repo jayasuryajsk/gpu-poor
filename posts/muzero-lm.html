@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MuZero for Language: World Models Work, Planning Doesn't Help</title>
+    <link rel="stylesheet" href="../style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>MuZero for Language: World Models Work, Planning Doesn't Help</h1>
+<p class="post-date">February 2026</p>
+<p class="subtitle">A 27M-param language model with a native world model. The dynamics model achieves 91% retrieval accuracy, but planning-augmented generation is just worse beam search.</p>
+
+<h2>Motivation</h2>
+
+<p>DeepMind's MuZero masters Chess, Go, and Atari by learning a world model (dynamics function that predicts future states) and using it for planning (tree search over imagined futures). Can the same idea improve language models?</p>
+
+<p>The pitch: instead of generating tokens one at a time, look ahead. For each candidate next token, simulate what happens 2-3 steps in the future using a cheap dynamics model. Pick the token that leads to the best future state.</p>
+
+<h2>Architecture</h2>
+
+<p>27M parameters total. Single file, PyTorch, trained on 500K TinyStories.</p>
+
+<table>
+    <tr><th>Component</th><th>Params</th><th>Description</th></tr>
+    <tr><td>Causal Transformer</td><td>~21M</td><td>4-layer GPT (d=512, 8 heads) &mdash; the base LM</td></tr>
+    <tr><td>Dynamics Model</td><td>~1.6M</td><td>Gated residual MLP: (state, token) &rarr; next state</td></tr>
+    <tr><td>Value Head</td><td>~131K</td><td>MLP predicting continuation quality (0-1)</td></tr>
+    <tr><td>Planner</td><td>~2.1M</td><td>Residual blocks predicting future state K steps ahead</td></tr>
+    <tr><td>Decoder</td><td>0</td><td>Tied to encoder embeddings</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="paramDistChart"></canvas></div>
+
+<p>The base model (encoder + tied decoder) is a standard GPT doing next-token prediction. The dynamics/value/planner are auxiliary heads trained alongside it.</p>
+
+<details>
+<summary>Code: Model Components</summary>
+<pre><code class="language-python">class CausalTransformerEncoder(nn.Module):
+    """GPT-style causal transformer -- the base language model."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.token_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_embed = nn.Embedding(cfg.max_len, cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.n_layers)
+        ])
+        self.norm = nn.LayerNorm(cfg.d_model)
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(cfg.max_len, cfg.max_len)).unsqueeze(0).unsqueeze(0),
+        )
+
+    def forward(self, ids, return_all=False):
+        B, T = ids.shape
+        pos = torch.arange(T, device=ids.device)
+        x = self.drop(self.token_embed(ids) + self.pos_embed(pos))
+        mask = self.causal_mask[:, :, :T, :T]
+        for block in self.blocks:
+            x = block(x, mask=mask)
+        x = self.norm(x)
+        return x if return_all else x[:, -1]  # [B, T, d] or [B, d]
+
+
+class DynamicsModel(nn.Module):
+    """Gated residual MLP: (state, token_id) -> next_state."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.action_embed = nn.Embedding(cfg.vocab_size, cfg.action_embed_dim)
+        in_dim = cfg.d_model + cfg.action_embed_dim
+        self.fc1 = nn.Linear(in_dim, cfg.dyn_hidden)
+        self.fc2 = nn.Linear(cfg.dyn_hidden, cfg.dyn_hidden)
+        self.fc3 = nn.Linear(cfg.dyn_hidden, cfg.d_model)
+        self.gate = nn.Linear(cfg.d_model, 1)
+        self.noise_std = cfg.dyn_noise_std
+
+    def forward(self, state, token_id, add_noise=False):
+        if add_noise and self.training and self.noise_std > 0:
+            state = state + torch.randn_like(state) * self.noise_std
+        a = self.action_embed(token_id)
+        x = torch.cat([state, a], dim=-1)
+        x = F.gelu(self.fc1(x))
+        x = F.gelu(self.fc2(x))
+        delta = self.fc3(x)
+        g = torch.sigmoid(self.gate(delta))
+        return state + g * delta  # gated residual
+
+
+class ValueHead(nn.Module):
+    """Predict continuation quality (0-1)."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.fc1 = nn.Linear(cfg.d_model, cfg.value_hidden)
+        self.fc2 = nn.Linear(cfg.value_hidden, 1)
+
+    def forward(self, state):
+        return torch.sigmoid(self.fc2(F.gelu(self.fc1(state))))
+
+
+def decode(state, embed_weight):
+    """Tied decoder: state -> logits via embedding weights."""
+    return F.linear(state, embed_weight)</code></pre>
+</details>
+
+<h2>Training: 5 losses</h2>
+
+<ol>
+    <li><strong>Reconstruction</strong> (weight 1.0) &mdash; standard next-token prediction through the encoder. This IS the base LM.</li>
+    <li><strong>Dynamics</strong> (weight 1.0) &mdash; predict future encoder states by rolling the dynamics model forward over real tokens. Measured by MSE + contrastive top-1 accuracy.</li>
+    <li><strong>Dynamics-Reconstruction</strong> (weight 0.5) &mdash; decode tokens from dynamics-predicted states. Multi-step unroll (5 steps). Directly trains the chain used at inference.</li>
+    <li><strong>Value</strong> (weight 0.3) &mdash; predict continuation quality = negative average cross-entropy of next 10 tokens from the encoder. Low perplexity continuations &rarr; high value.</li>
+    <li><strong>Planner</strong> (weight 0.5) &mdash; predict future encoder state K steps ahead via iterated residual blocks.</li>
+</ol>
+
+<details>
+<summary>Code: Loss Computation (5 losses)</summary>
+<pre><code class="language-python">def compute_losses(model, ids, mask, cfg):
+    """
+    Compute all 5 losses.
+    ids: [B, T], mask: [B, T] (True where valid)
+    """
+    B, T = ids.shape
+    device = ids.device
+
+    # -- 1. Reconstruction loss (next-token prediction) --
+    all_h = model.encoder(ids, return_all=True)  # [B, T, d]
+    logits = model.decode(all_h[:, :-1])          # [B, T-1, V]
+    targets = ids[:, 1:]                           # [B, T-1]
+    recon_mask = mask[:, 1:]
+
+    L_recon = F.cross_entropy(
+        logits[recon_mask].view(-1, cfg.vocab_size),
+        targets[recon_mask].view(-1),
+        reduction="mean",
+    )
+
+    # -- 2. Dynamics loss (predict future encoder states) --
+    all_h_det = all_h.detach()
+    L_dyn = torch.tensor(0.0, device=device)
+    dyn_count = 0
+    h_preds, h_targets = [], []
+
+    for _ in range(cfg.dyn_samples):         # 5 samples
+        b = random.randint(0, B - 1)
+        seq_len = mask[b].sum().item()
+        # ... pick random start position and jump length (3-15 steps) ...
+        h = all_h_det[b, start]
+        for s in range(jump):
+            next_tok = ids[b, start + s + 1]
+            h = model.dynamics(h, next_tok, add_noise=True)
+        target_h = all_h_det[b, start + jump]
+        L_dyn = L_dyn + F.mse_loss(h, target_h)
+        dyn_count += 1
+        h_preds.append(h); h_targets.append(target_h)
+
+    if dyn_count > 0:
+        L_dyn = L_dyn / dyn_count
+
+    # Contrastive top-1 accuracy
+    if len(h_preds) >= 2:
+        hp = F.normalize(torch.stack(h_preds), dim=-1)
+        ht = F.normalize(torch.stack(h_targets), dim=-1)
+        sim = hp @ ht.T * 20.0
+        dyn_top1 = (sim.argmax(1) == torch.arange(len(h_preds), device=device)).float().mean().item()
+
+    # -- 3. Dynamics-reconstruction loss (multi-step decode) --
+    L_dyn_recon = torch.tensor(0.0, device=device)
+    for _ in range(cfg.dyn_recon_samples):   # 3 samples, 5-step unroll
+        # ... pick random start ...
+        h = all_h_det[b, start]
+        for step in range(cfg.dyn_recon_unroll):
+            next_tok = ids[b, pos]
+            h = model.dynamics(h, next_tok, add_noise=True)
+            step_logits = model.decode(h)
+            target_tok = ids[b, pos + 1]
+            step_loss += F.cross_entropy(step_logits.unsqueeze(0), target_tok.unsqueeze(0))
+        L_dyn_recon += step_loss / valid_steps
+
+    # -- 4. Value loss --
+    L_value = torch.tensor(0.0, device=device)
+    K = cfg.value_K  # 10
+    for b in range(min(B, 8)):
+        pos = random.randint(0, int(seq_len) - K - 2)
+        with torch.no_grad():
+            future_h = all_h_det[b, pos:pos + K]
+            future_logits = model.decode(future_h)
+            future_targets = ids[b, pos + 1:pos + K + 1]
+            avg_ce = F.cross_entropy(future_logits, future_targets, reduction="mean")
+            value_target = torch.sigmoid(-avg_ce / cfg.value_temp)  # low CE -> high value
+        value_pred = model.value_head(all_h_det[b, pos])
+        L_value += F.mse_loss(value_pred.squeeze(), value_target)
+
+    # -- 5. Planner loss --
+    L_plan = torch.tensor(0.0, device=device)
+    for _ in range(cfg.plan_samples):        # 5 samples
+        # ... pick random start and k (3-15 steps ahead) ...
+        h0 = all_h_det[b, start]
+        h_target = all_h_det[b, start + k]
+        depth = min(k, 4)
+        h_plan = model.planner(h0, depth=depth)
+        L_plan += F.mse_loss(h_plan, h_target)
+
+    # -- Total loss (weighted sum) --
+    L_total = (
+        1.0 * L_recon
+        + 1.0 * L_dyn
+        + 0.5 * L_dyn_recon
+        + 0.3 * L_value
+        + 0.5 * L_plan
+    )
+    return L_total, metrics</code></pre>
+</details>
+
+<h2>Training results</h2>
+
+<p>Trained for 14,000 steps on a single L40S GPU before stopping early (metrics plateaued).</p>
+
+<table>
+    <tr><th>Step</th><th>Recon</th><th>Dyn Top-1</th><th>Dyn-Recon</th><th>Ratio</th><th>Value</th><th>Plan</th></tr>
+    <tr><td>1,000</td><td>8.31</td><td>22%</td><td>11.6</td><td>1.40x</td><td>0.003</td><td>0.048</td></tr>
+    <tr><td>2,000</td><td>5.55</td><td>24%</td><td>9.22</td><td>1.66x</td><td>0.003</td><td>0.021</td></tr>
+    <tr><td>5,000</td><td>3.64</td><td>69%</td><td>5.42</td><td>1.49x</td><td>0.005</td><td>0.008</td></tr>
+    <tr><td>8,000</td><td>3.04</td><td>77%</td><td>5.06</td><td>1.66x</td><td>0.006</td><td>0.009</td></tr>
+    <tr><td>10,000</td><td>2.80</td><td>83%</td><td>4.58</td><td>1.63x</td><td>0.006</td><td>0.010</td></tr>
+    <tr><td>12,000</td><td>2.68</td><td>87%</td><td>4.60</td><td>1.72x</td><td>0.006</td><td>0.010</td></tr>
+    <tr><td>14,000</td><td>2.60</td><td>91%</td><td>4.50</td><td>1.73x</td><td>0.006</td><td>0.010</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="trainingCurvesChart"></canvas></div>
+
+<h3>The dynamics model works</h3>
+
+<p>Top-1 contrastive accuracy climbs from 22% to 91%. Given a dynamics-predicted state, it can correctly identify the matching encoder state out of a batch of 5. The world model genuinely learns to simulate how the transformer's hidden states evolve as tokens are processed.</p>
+
+<h3>The dyn_recon/recon ratio doesn't close</h3>
+
+<p>The ratio hovers around 1.6x throughout training. Both losses drop in parallel, but dynamics-predicted states are consistently 60-73% worse at decoding than real encoder states. The dynamics model learns the <em>direction</em> of states well (91% contrastive accuracy via cosine similarity) but not the exact values needed for the tied decoder.</p>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="ratioChart"></canvas></div>
+
+<h2>Inference: two modes</h2>
+
+<p><strong>Baseline (standard autoregressive):</strong> Encode full sequence, decode last position, sample next token. Standard GPT generation.</p>
+
+<p><strong>Planning-augmented:</strong> Encode full sequence, get top-10 candidate tokens, for each candidate simulate 2 steps ahead with the dynamics model, score with value head, pick the candidate with the best combined score (85% base log-probability + 15% future value).</p>
+
+<p>Planning cost per token: 10 candidates &times; 2 dynamics calls = 20 small MLP forward passes. Negligible vs one transformer encoder pass.</p>
+
+<details>
+<summary>Code: Baseline Generation (standard autoregressive)</summary>
+<pre><code class="language-python">@torch.no_grad()
+def generate_baseline(model, tokenizer, prompt,
+                      max_new_tokens=200, temperature=0.6,
+                      top_p=0.9, rep_penalty=1.2):
+    """Standard autoregressive generation -- no planning."""
+    model.eval()
+    device = model.device
+    ids = tokenizer.encode(prompt, add_eos=False)
+    ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+
+    for _ in range(max_new_tokens):
+        if ids.shape[1] >= model.cfg.max_len:
+            break
+        h = model.encoder(ids, return_all=False)  # [1, d]
+        logits = model.decode(h).squeeze(0)        # [V]
+
+        # Repetition penalty
+        if rep_penalty != 1.0:
+            for prev_id in ids[0, -50:].tolist():
+                if logits[prev_id] > 0:
+                    logits[prev_id] /= rep_penalty
+                else:
+                    logits[prev_id] *= rep_penalty
+
+        # Temperature + nucleus (top-p) sampling
+        logits = logits / temperature
+        probs = F.softmax(logits, dim=-1)
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cum_probs = sorted_probs.cumsum(dim=-1)
+        cutoff = (cum_probs - sorted_probs) >= top_p
+        sorted_probs[cutoff] = 0.0
+        sorted_probs /= sorted_probs.sum()
+
+        token = sorted_idx[torch.multinomial(sorted_probs, 1)].item()
+        if token == tokenizer.EOS:
+            break
+        ids = torch.cat([ids, torch.tensor([[token]], device=device)], dim=1)
+
+    return tokenizer.decode(ids[0].tolist())</code></pre>
+</details>
+
+<details>
+<summary>Code: Planning-Augmented Generation (lookahead via dynamics + value)</summary>
+<pre><code class="language-python">@torch.no_grad()
+def generate_planning(model, tokenizer, prompt,
+                      max_new_tokens=200, temperature=0.6,
+                      top_p=0.9, rep_penalty=1.2,
+                      plan_lambda=0.15, plan_candidates=10,
+                      plan_depth=2):
+    """Planning-augmented generation -- lookahead via dynamics + value."""
+    model.eval()
+    device = model.device
+    ids = tokenizer.encode(prompt, add_eos=False)
+    ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+
+    for _ in range(max_new_tokens):
+        if ids.shape[1] >= model.cfg.max_len:
+            break
+        h = model.encoder(ids, return_all=False)
+        state = h.squeeze(0)                       # [d]
+        logits = model.decode(state)                # [V]
+
+        # Repetition penalty (same as baseline)
+        if rep_penalty != 1.0:
+            for prev_id in ids[0, -50:].tolist():
+                if logits[prev_id] > 0:
+                    logits[prev_id] /= rep_penalty
+                else:
+                    logits[prev_id] *= rep_penalty
+
+        # Get top-K candidates
+        logits_t = logits / temperature
+        probs = F.softmax(logits_t, dim=-1)
+        top_probs, top_ids = torch.topk(probs, plan_candidates)
+
+        # Score each candidate via dynamics lookahead
+        scores = []
+        for i in range(plan_candidates):
+            tok = top_ids[i]
+            log_p = torch.log(top_probs[i] + 1e-10)
+
+            # Multi-step lookahead
+            s = model.dynamics(state, tok)
+            for d in range(1, plan_depth):
+                next_logits = model.decode(s)
+                best_next = next_logits.argmax()   # greedy rollout
+                s = model.dynamics(s, best_next)
+
+            future_val = model.value_head(s).squeeze()
+            score = (1.0 - plan_lambda) * log_p + plan_lambda * future_val
+            scores.append(score)
+
+        scores = torch.stack(scores)
+        best_idx = scores.argmax()
+        token = top_ids[best_idx].item()
+
+        if token == tokenizer.EOS:
+            break
+        ids = torch.cat([ids, torch.tensor([[token]], device=device)], dim=1)
+
+    return tokenizer.decode(ids[0].tolist())</code></pre>
+</details>
+
+<h2>Generation comparison (step 12,000)</h2>
+
+<p>Prompt: <em>"Once upon a time"</em></p>
+<pre><code>BASE: once upon a time, there was a little girl named
+lily. she loved to play outside in the sunshine
+and look for bugs. one day, her mommy took her
+to the park with her toys and they went on an
+adventure together at school where it was going!
+
+PLAN: once upon a time, there was a little girl named
+lily. she loved to play outside in the sunshine
+and look for bugs. one day, her mommy gave her
+some food to eat it because they were yummy food
+for dinner!</code></pre>
+
+<p>Both produce grammatical, on-topic TinyStories text. Neither is noticeably better. This pattern held across all 8 test prompts at every checkpoint.</p>
+
+<h2>Why planning doesn't help</h2>
+
+<div class="callout callout-red">
+Planning-augmented generation is a worse version of beam search.
+</div>
+
+<p>The argument is straightforward:</p>
+
+<ol>
+    <li><strong>Beam search</strong> evaluates K candidate continuations by running the <em>actual model</em> forward. It uses exact probabilities from the real encoder.</li>
+    <li><strong>Planning</strong> evaluates K candidates by running a <em>cheap MLP approximation</em> (the dynamics model) forward. It uses approximate states that are 60% worse at decoding.</li>
+</ol>
+
+<p>The dynamics model is strictly worse than the encoder at predicting next-token probabilities. Any decision planning makes based on dynamics-predicted states could be made better by just running the encoder instead.</p>
+
+<p>The value head compounds the problem. It's trained to predict self-perplexity: "from this state, how well does the encoder predict the next 10 tokens?" This is a learned version of "pick low-perplexity continuations" &mdash; which is exactly what low temperature and nucleus sampling already do, without needing a world model.</p>
+
+<h3>The MuZero analogy breaks down</h3>
+
+<p>In games:</p>
+<ul>
+    <li>The dynamics model learns <strong>environment physics</strong> &mdash; how the board changes when you make a move. The agent doesn't control the environment.</li>
+    <li>Planning discovers strategies the agent hasn't seen by <em>imagining</em> future game states.</li>
+    <li>The value function captures game outcomes (win/lose) which require looking many moves ahead.</li>
+</ul>
+
+<p>In language:</p>
+<ul>
+    <li>The dynamics model approximates <strong>the model's own computation</strong>. There is no external environment &mdash; the model generates both the "moves" (tokens) and the "board state" (hidden states).</li>
+    <li>Planning can't discover anything the model doesn't already know, because it's simulating the model with a worse approximation of itself.</li>
+    <li>The value function captures self-perplexity, not text quality. A degenerate state that outputs "the the the" would score high.</li>
+</ul>
+
+<p>The fundamental issue: MuZero planning works because the dynamics model provides information the policy network doesn't have (environment transitions). In language, the encoder already <em>is</em> the environment. There's nothing new for the dynamics model to contribute.</p>
+
+<h2>What did work</h2>
+
+<p>The world model concept itself is validated. A small MLP can learn to simulate transformer hidden state evolution with 87% accuracy. This is a genuine finding &mdash; it means transformer representations have learnable sequential structure that a much smaller model can approximate.</p>
+
+<p>This could be useful for:</p>
+<ul>
+    <li><strong>Speculative decoding</strong> &mdash; use the dynamics model to draft future tokens cheaply, then verify with the real encoder</li>
+    <li><strong>State caching</strong> &mdash; skip re-encoding by predicting the next state from the current one</li>
+    <li><strong>External reward planning</strong> &mdash; if you had a reward model trained on human preferences (not self-perplexity), planning could steer generation toward preferred outputs</li>
+</ul>
+
+<p>The architecture isn't flawed. The reward signal is.</p>
+
+<div class="page-nav">
+    <a href="dead-ends.html">&larr; Prev: Dead Ends</a>
+    <a href="whats-left.html">Next: What's Left &rarr;</a>
+</div>
+
+<footer>
+    <p>Built with real experiments, not theory.<br>February 2026</p>
+</footer>
+
+</div>
+
+<script>
+Chart.defaults.font.family = "'Courier Prime', monospace";
+
+// --- Chart 1: Training Curves (Dual Y-Axis) ---
+(function() {
+    const ctx = document.getElementById('trainingCurvesChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [1000, 2000, 5000, 8000, 10000, 12000, 14000],
+            datasets: [
+                {
+                    label: 'Recon Loss',
+                    data: [8.31, 5.55, 3.64, 3.04, 2.80, 2.68, 2.60],
+                    borderColor: '#8b4513',
+                    backgroundColor: '#8b4513',
+                    yAxisID: 'y',
+                    tension: 0.3,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    borderWidth: 2
+                },
+                {
+                    label: 'Dyn Top-1 %',
+                    data: [22, 24, 69, 77, 83, 87, 91],
+                    borderColor: '#2d6a30',
+                    backgroundColor: '#2d6a30',
+                    yAxisID: 'y1',
+                    tension: 0.3,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    borderWidth: 2
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Training Progress: Loss \u2193 while Dynamics Accuracy \u2191',
+                    font: { size: 14 }
+                },
+                legend: {
+                    labels: { usePointStyle: true }
+                }
+            },
+            scales: {
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Training Steps'
+                    },
+                    grid: { color: '#d4cfc4' }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    title: {
+                        display: true,
+                        text: 'Recon Loss',
+                        color: '#8b4513'
+                    },
+                    ticks: { color: '#8b4513' },
+                    grid: { color: '#d4cfc4' }
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Dyn Top-1 %',
+                        color: '#2d6a30'
+                    },
+                    ticks: { color: '#2d6a30' },
+                    grid: { drawOnChartArea: false }
+                }
+            }
+        }
+    });
+})();
+
+// --- Chart 2: Dyn-Recon / Recon Ratio ---
+(function() {
+    const ctx = document.getElementById('ratioChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [1000, 2000, 5000, 8000, 10000, 12000, 14000],
+            datasets: [
+                {
+                    label: 'Dyn-Recon / Recon',
+                    data: [1.40, 1.66, 1.49, 1.66, 1.63, 1.72, 1.73],
+                    borderColor: '#a82020',
+                    backgroundColor: '#a82020',
+                    tension: 0.3,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    borderWidth: 2
+                },
+                {
+                    label: 'perfect = 1.0x',
+                    data: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                    borderColor: '#a82020',
+                    backgroundColor: 'transparent',
+                    borderDash: [6, 4],
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    pointHoverRadius: 0
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Dyn-Recon / Recon Ratio (stuck at ~1.6x)',
+                    font: { size: 14 }
+                },
+                legend: {
+                    labels: { usePointStyle: true }
+                }
+            },
+            scales: {
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Training Steps'
+                    },
+                    grid: { color: '#d4cfc4' }
+                },
+                y: {
+                    min: 0.8,
+                    max: 2.0,
+                    title: {
+                        display: true,
+                        text: 'Ratio'
+                    },
+                    grid: { color: '#d4cfc4' }
+                }
+            }
+        }
+    });
+})();
+
+// --- Chart 3: Architecture Parameter Distribution ---
+(function() {
+    const ctx = document.getElementById('paramDistChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+            labels: ['Encoder (21M)', 'Dynamics (1.6M)', 'Planner (2.1M)', 'Value Head (0.131M)'],
+            datasets: [{
+                data: [21, 1.6, 2.1, 0.131],
+                backgroundColor: ['#8b4513', '#5b3a8c', '#2d6a30', '#a82020'],
+                borderColor: '#fff',
+                borderWidth: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Parameter Distribution (27M total)',
+                    font: { size: 14 }
+                },
+                legend: {
+                    position: 'bottom',
+                    labels: { usePointStyle: true }
+                }
+            }
+        }
+    });
+})();
+</script>
+</body>
+</html>

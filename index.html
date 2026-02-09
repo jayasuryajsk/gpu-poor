@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What I Learned Failing at ML Research</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="index.html" class="site-title">~ failing at ml research</a>
+        <a href="index.html" class="active">posts</a>
+        <a href="posts/about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>What I Learned Failing at ML Research</h1>
+<p class="subtitle">
+    Months of experiments on optimizer design, loss landscapes, and world models for language.
+    Most of it didn't work. Here's what I measured.
+</p>
+
+<ul class="post-list">
+    <li>
+        <a href="posts/landscape.html">The Loss Landscape of a Small GPT</a>
+        <div class="post-desc">8 experiments probing sharpness, gradient noise, trajectory geometry, and mode connectivity on a 5M-param toy model.</div>
+        <div class="post-tags">
+            <span class="tag tag-finding">Measurements</span>
+        </div>
+    </li>
+    <li>
+        <a href="posts/fingerprints.html">Optimizer Fingerprints: Muon vs Adam vs SGD</a>
+        <div class="post-desc">Spectral decomposition of weight updates. What optimizers actually do to the weights at each step.</div>
+        <div class="post-tags">
+            <span class="tag tag-novel">Novel</span>
+        </div>
+    </li>
+    <li>
+        <a href="posts/scaling.html">Scaling Laws for Landscape Geometry</a>
+        <div class="post-desc">Power-law relationships between architecture (width, depth, batch, vocab) and landscape properties (SNR, rank, sharpness).</div>
+        <div class="post-tags">
+            <span class="tag tag-finding">Measurements</span>
+        </div>
+    </li>
+    <li>
+        <a href="posts/toy-vs-real.html">Toy Model vs Real Model: What Transfers?</a>
+        <div class="post-desc">Validating toy model findings on 73M nanochat with FineWeb-Edu. The results were humbling.</div>
+        <div class="post-tags">
+            <span class="tag tag-finding">Measurements</span>
+        </div>
+    </li>
+    <li>
+        <a href="posts/dead-ends.html">Five Dead Ends (And Why They Failed)</a>
+        <div class="post-desc">SpectraMuon, Noether conservation, cross-batch curvature, adaptive LR, line search. Each killed by experiment.</div>
+        <div class="post-tags">
+            <span class="tag tag-dead">Dead Ends</span>
+        </div>
+    </li>
+    <li>
+        <a href="posts/muzero-lm.html">MuZero for Language: World Models Work, Planning Doesn't Help</a>
+        <div class="post-desc">A 27M-param language model with a native world model. Dynamics hits 88% accuracy but planning is just worse beam search.</div>
+        <div class="post-tags">
+            <span class="tag tag-dead">Dead End</span>
+            <span class="tag tag-finding">Measurements</span>
+        </div>
+    </li>
+    <li>
+        <a href="posts/whats-left.html">What's Left</a>
+        <div class="post-desc">Three open threads: rank-aware Muon, weight decay hurts Muon, value projections need special treatment.</div>
+        <div class="post-tags">
+            <span class="tag tag-open">Open</span>
+        </div>
+    </li>
+</ul>
+
+<footer>
+    <p>Built with real experiments, not theory. All measurements reproducible from source.<br>
+    February 2026</p>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About</title>
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html" class="active">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>About</h1>
+
+<p>This is a collection of experiments on transformer training dynamics, optimizer design, and language model architecture. Most of the ideas didn't work. The measurements are real.</p>
+
+<h2>Setup</h2>
+
+<ul>
+    <li><strong>Toy model:</strong> 5M param custom GPT, synthetic bigram data</li>
+    <li><strong>Real model:</strong> 73M param nanochat (Karpathy), FineWeb-Edu</li>
+    <li><strong>MuZero LM:</strong> 27M param transformer + world model, TinyStories</li>
+    <li><strong>Hardware:</strong> M4 Mac Mini (experiments), L40S (MuZero training)</li>
+    <li><strong>Optimizer:</strong> Muon + AdamW (nanochat default)</li>
+</ul>
+
+<p>Every number comes from an actual experiment. No theory-only claims. All code and raw results are reproducible.</p>
+
+<h2>Why publish failures</h2>
+
+<p>ML research has a publication bias toward things that work. But knowing what <em>doesn't</em> work &mdash; and exactly why &mdash; is just as valuable. If these notes save someone else from spending weeks on SpectraMuon or cross-batch curvature, they've done their job.</p>
+
+<footer>
+    <p>February 2026</p>
+</footer>
+
+</div>
+</body>
+</html>

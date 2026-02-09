@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What's Left</title>
+    <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>What's Left</h1>
+<p class="post-date">February 2026</p>
+<p class="subtitle">Three open threads that haven't been killed yet. They might be dead ends too. But the measurements suggest they're worth trying.</p>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">Rank-Aware Muon</h3>
+        <span class="tag tag-open">Open</span>
+    </div>
+    <p><strong>The observation:</strong> Value projection gradients are rank-1. MLP gradients are rank 3-8. lm_head gradients are rank 15.7. But Muon orthogonalizes everything identically into full-rank updates via Newton-Schulz.</p>
+    <p><strong>The problem:</strong> For a rank-1 gradient, Muon amplifies 383 noise directions for every 1 signal direction. For a rank-8 gradient, it amplifies 376 noise directions for every 8 signal directions. The orthogonalization is <em>most</em> harmful where it's least needed.</p>
+    <p><strong>The idea:</strong> Adapt the number of Newton-Schulz iterations (or the orthogonalization strength) based on measured gradient rank. Low-rank layers get fewer iterations (closer to Adam behavior). High-rank layers get full orthogonalization (standard Muon). This could improve efficiency without hurting the layers where Muon already works well.</p>
+    <p><strong>Status:</strong> Not yet tested. The per-layer rank measurements are solid (consistent across runs, clean measurements on both toy and real models). The intervention is straightforward to implement.</p>
+</div>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">Weight Decay Hurts Muon</h3>
+        <span class="tag tag-open">Open</span>
+    </div>
+    <p><strong>The observation:</strong> On 73M nanochat, removing weight decay improved loss from 4.97 to 4.90. Small (0.07) but consistent across runs.</p>
+    <p><strong>The hypothesis:</strong> Muon already produces well-conditioned updates (condition number 6-10). Weight decay's main benefit is regularization (preventing large weights / ill-conditioned updates). Since Muon inherently prevents ill-conditioned updates through orthogonalization, weight decay is redundant &mdash; and the parameter shrinkage it causes is actively harmful, pulling weights back toward initialization when they should be moving far away (Muon travels 59,000+ units from init).</p>
+    <p><strong>Status:</strong> Observed on one model (nanochat, 1000 steps). Needs validation at longer training and different scales. Could be a training-length artifact.</p>
+</div>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">Value Projection is Special</h3>
+        <span class="tag tag-open">Open</span>
+    </div>
+    <p><strong>The observation:</strong> c_v (value projection) layers have uniquely low gradient rank (1.1-1.5), lower than any other layer type. They also have relatively high sensitivity.</p>
+    <p><strong>The hypothesis:</strong> Value projections might benefit from a different optimizer entirely. Since their gradients are rank-1, Muon's orthogonalization is maximally harmful here (amplifying 383 noise directions per 1 signal direction). Adam, which naturally produces low-rank updates, might be better suited.</p>
+    <p><strong>Status:</strong> Pure hypothesis. The measurements are solid but the intervention is untested. nanochat already uses separate optimizers for different parameter groups (Muon for matrices, AdamW for scalars/embeddings). Adding c_v to the AdamW group would be a small code change.</p>
+</div>
+
+<h2>The honest summary</h2>
+
+<p>Every "clever trick" either reduces to something simple that already exists (SpectraMuon is an LR change, planning is worse beam search) or the signal isn't there (curvature, conservation laws, line search).</p>
+
+<p>The measurements themselves are genuine. The optimizer fingerprints, the scaling laws, the landscape geometry, the gradient rank structure &mdash; these are real findings that describe how transformer training actually works. They just haven't led to a better optimizer. Yet.</p>
+
+<p>The strongest lead is rank-aware optimization. The gradient rank measurements are the most surprising finding in this whole body of work: value projections having rank-1 gradients means Muon is doing something clearly suboptimal for those layers. Whether fixing that actually improves training loss remains to be seen.</p>
+
+<div class="page-nav">
+    <a href="muzero-lm.html">&larr; Prev: MuZero for Language</a>
+    <span></span>
+</div>
+
+<footer>
+    <p>Built with real experiments, not theory.<br>February 2026</p>
+</footer>
+
+</div>
+</body>
+</html>

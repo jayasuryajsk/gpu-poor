@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Optimizer Fingerprints: Muon vs Adam vs SGD</title>
+    <link rel="stylesheet" href="../style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>Optimizer Fingerprints: Muon vs Adam vs SGD</h1>
+<p class="post-date">February 2026</p>
+<p class="subtitle">I measured the spectral properties of each optimizer's weight updates. This is what they actually do to the weights at each step.</p>
+
+<h2>The fingerprints</h2>
+
+<table>
+    <tr><th>Property</th><th>Muon</th><th>Adam</th><th>SGD</th></tr>
+    <tr><td>Update effective rank</td><td>145-178 / 256</td><td>11-60 / 256</td><td>12-50 / 256</td></tr>
+    <tr><td>Condition number</td><td>6-10</td><td>30-28,000</td><td>-</td></tr>
+    <tr><td>Step efficiency (&Delta;loss/step)</td><td>0.73</td><td>0.21</td><td>0.03</td></tr>
+    <tr><td>Spectrum inversion</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+</table>
+
+<div class="callout callout-green">
+<strong>Key finding:</strong> Muon produces full-rank, well-conditioned updates. Adam produces low-rank, extremely ill-conditioned updates (condition number up to 28,000). Both Muon and Adam invert the gradient spectrum &mdash; they boost weak singular directions and suppress dominant ones. SGD does not.
+</div>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartEffectiveRank"></canvas></div>
+
+<h3>How I measured this</h3>
+
+<p>For each optimizer, I ran 500 training steps on a 5M-parameter GPT. Every 50 steps (after 50 warmup), I saved the weight matrix before the step, grabbed the gradient, ran the optimizer step, and computed the update as <code>delta_W = W_before - W_after</code>. Then I took the SVD of both gradient and update.</p>
+
+<details><summary>Code: capturing weight updates and computing SVD fingerprints</summary>
+<pre><code># From optimizer_fingerprints.py — the core measurement loop.
+# For each layer, snapshot weights before/after the optimizer step.
+
+if do_measure:
+    w_before = {n: p.data.float().cpu().clone()
+                for n, p in param_map.items()}
+
+opt.zero_grad(set_to_none=True)
+_, loss = model(x, y)
+loss.backward()
+
+if do_measure:
+    grads = {}
+    for n, p in param_map.items():
+        if p.grad is not None:
+            grads[n] = p.grad.float().cpu().clone()
+
+opt.step()
+
+if do_measure:
+    w_after = {n: p.data.float().cpu().clone()
+               for n, p in param_map.items()}
+    updates = {n: w_before[n] - w_after[n] for n in w_before}
+</code></pre>
+</details>
+
+<details><summary>Code: SVD analysis &mdash; rank, condition number, spectrum inversion</summary>
+<pre><code># SVD of gradient and update
+Ug, sg, Vhg = torch.linalg.svd(g, full_matrices=False)
+su = torch.linalg.svdvals(u)
+
+# Project update into gradient's singular basis
+# This reveals how the optimizer reshapes each direction
+proj = Ug.T @ u @ Vhg.T
+diag_proj = torch.diag(proj)
+
+# Per-direction amplification: how much did the optimizer
+# scale each gradient singular direction?
+amp_raw = diag_proj.abs() / (sg + 1e-10)
+
+# Normalized amplification (mean=1) — shows SHAPE not scale
+amp_norm = amp_raw / (amp_raw.mean() + 1e-10)
+
+# Effective rank: participation ratio of squared singular values
+# rank_g near 256 = full rank, rank_g near 1 = rank deficient
+rank_g = (sg ** 2).sum() / (sg[0] ** 2 + 1e-10)
+rank_u = (su ** 2).sum() / (su[0] ** 2 + 1e-10)
+
+# Condition number: ratio of largest to smallest singular value
+cond_g = sg[0] / (sg[-1] + 1e-10)
+cond_u = su[0] / (su[-1] + 1e-10)
+
+# Gradient-update alignment (cosine similarity)
+align = F.cosine_similarity(g.flatten(), u.flatten(), dim=0)
+
+# On-axis fraction: how much update energy stays in
+# the gradient's singular directions vs leaking off-axis
+diag_energy = (diag_proj ** 2).sum()
+total_energy = (proj ** 2).sum()
+on_axis = diag_energy / (total_energy + 1e-10)
+</code></pre>
+</details>
+
+<details><summary>Code: spectrum inversion detection</summary>
+<pre><code># From print_summary() — detecting whether the optimizer
+# inverts the gradient spectrum or preserves it.
+#
+# amp_norm[i] = per-direction LR / mean LR
+# If top singular direction has amp_norm &lt; 1 and bottom has &gt; 1,
+# the optimizer INVERTS the spectrum (boosts weak directions).
+
+amp = np.mean([d["amp_norm"] for d in last3], axis=0)
+n = len(amp)
+top_bot = amp[0] / (amp[-1] + 1e-10)
+
+if top_bot > 3.0:
+    pat = "PRESERVES structure"      # keeps gradient ranking
+elif top_bot > 1.5:
+    pat = "PARTIAL preserve"
+elif top_bot > 0.7:
+    pat = "FLAT (uniform)"           # equalizes all directions
+elif top_bot > 0.3:
+    pat = "PARTIAL inverse"
+else:
+    pat = "INVERTS (boosts weak dirs)"  # flips the spectrum
+
+# Result: Muon and Adam both land in "INVERTS" territory.
+# SGD lands in "FLAT" or "PRESERVES" — it follows the gradient.
+</code></pre>
+</details>
+
+<h2>What "spectrum inversion" means</h2>
+
+<p>Take the SVD of the gradient: G = U &Sigma; V<sup>T</sup>. The gradient has a few large singular values (dominant directions) and many small ones (weak directions).</p>
+
+<p>SGD just follows the gradient, so its updates have the same spectrum &mdash; dominated by a few directions.</p>
+
+<p>Adam and Muon both <em>invert</em> this: they suppress the strong directions and amplify the weak ones. Adam does this implicitly through its second-moment normalization. Muon does it explicitly through Newton-Schulz orthogonalization, which maps all singular values to 1.</p>
+
+<p>The result: Muon's updates use all 256 directions roughly equally (effective rank 145-178), while Adam concentrates on 11-60 directions. Muon moves the weights across the full parameter space; Adam moves them along a low-dimensional subspace.</p>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartSpectralReshaping"></canvas></div>
+
+<h3>The spectral fingerprint function</h3>
+
+<p>The second experiment (exp4) measured this more precisely as the "spectral fingerprint" &mdash; for each gradient singular value &sigma;<sub>i</sub>, what does the optimizer's update do to it? This is the function &phi;(&sigma;) = &sigma;<sub>update</sub> / &sigma;<sub>gradient</sub> for each singular direction.</p>
+
+<details><summary>Code: computing the spectral fingerprint &phi;(&sigma;)</summary>
+<pre><code>def spectral_fingerprint(G, delta_W):
+    """
+    Compute the spectral fingerprint: for aligned singular directions,
+    measure sigma_update / sigma_gradient.
+
+    We project delta_W onto the singular directions of G to get the
+    reshaping function phi(sigma_G) that the optimizer applies.
+    """
+    U_g, S_g, Vt_g = compute_svd(G)
+    U_dw, S_dw, Vt_dw = compute_svd(delta_W)
+
+    # Project delta_W onto gradient's singular basis:
+    # sigma_update_i = ||U_g[:,i]^T @ delta_W @ V_g[i,:]^T||
+    # This measures how much the update aligns with each
+    # gradient direction
+    proj = U_g.T @ delta_W.float() @ Vt_g.T  # (min_dim, min_dim)
+    sigma_proj = torch.diag(proj).abs()
+
+    # The fingerprint: ratio of projected update SV
+    # to gradient SV. This IS the optimizer's transfer function.
+    eps = 1e-10
+    phi = sigma_proj / (S_g + eps)
+
+    return {
+        "sigma_grad": S_g.numpy(),
+        "sigma_update": S_dw.numpy(),
+        "sigma_proj": sigma_proj.numpy(),
+        "phi": phi.numpy(),
+        "S_g": S_g.numpy(),
+    }
+</code></pre>
+</details>
+
+<p>For a perfectly equalizing optimizer (like ideal Muon), &phi;(&sigma;) would be constant &mdash; every singular direction gets the same amplification regardless of gradient magnitude. For Adam, &phi;(&sigma;) correlates with 1/&sigma; &mdash; it amplifies weak directions more, but inconsistently. For SGD, &phi;(&sigma;) is roughly constant at whatever the learning rate is.</p>
+
+<details><summary>Code: characterizing the fingerprint shape (constant vs 1/&sigma; vs mixed)</summary>
+<pre><code># From the analysis section of exp4:
+# Compute coefficient of variation (CV) of phi — lower = more constant
+phi_cv = np.std(all_phi) / (np.mean(all_phi) + 1e-10)
+
+# Correlation between phi and 1/sigma_grad:
+# High positive correlation = Adam-like (adaptive scaling)
+corr_inv = np.corrcoef(all_phi, 1.0 / (all_sg + 1e-10))[0, 1]
+
+if phi_cv < 0.3:
+    print("Near-constant phi: EQUALIZING (Muon-like)")
+elif corr_inv > 0.5:
+    print("phi ~ 1/sigma: ADAPTIVE SCALING (Adam-like)")
+else:
+    print("Mixed reshaping pattern")
+</code></pre>
+</details>
+
+<h2>Step efficiency</h2>
+
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="metric-value">0.73</div>
+        <div class="metric-label">Muon &Delta;loss/step</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value">0.21</div>
+        <div class="metric-label">Adam &Delta;loss/step</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value">0.03</div>
+        <div class="metric-label">SGD &Delta;loss/step</div>
+    </div>
+</div>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartStepEfficiency"></canvas></div>
+
+<p>Muon is 3.5x more efficient per step than Adam and 24x more efficient than SGD. It makes well-conditioned updates across all singular directions simultaneously, while Adam concentrates its updates in a low-dimensional subspace.</p>
+
+<details><summary>Code: how step efficiency was computed</summary>
+<pre><code># From optimizer_fingerprints.py — Table 3: Training efficiency.
+# For each measurement step, record loss before and after the
+# optimizer step on the SAME batch. The difference is the
+# per-step loss reduction (step efficiency).
+
+for o in opts:
+    ms = all_res[o]
+    start = ms[0]["loss_b"]
+    end = ms[-1]["loss_a"]
+    avg_dl = np.mean([m["loss_b"] - m["loss_a"] for m in ms])
+    print(f"  {o:&lt;12s} {start:>11.4f} {end:>11.4f} {avg_dl:>11.4f}")
+</code></pre>
+</details>
+
+<h2>Gradient rank is very low</h2>
+
+<p>On the real 73M nanochat model (not the toy model), I measured per-layer effective gradient rank:</p>
+
+<table>
+    <tr><th>Layer Type</th><th>Effective Rank</th><th>Max Possible</th></tr>
+    <tr><td>c_v (value projection)</td><td>1.1-1.5</td><td>384</td></tr>
+    <tr><td>c_q, c_k (query/key)</td><td>2.0-7.3</td><td>384</td></tr>
+    <tr><td>c_proj (output projection)</td><td>1.3-7.1</td><td>384</td></tr>
+    <tr><td>MLP c_fc</td><td>3.0-6.8</td><td>384</td></tr>
+    <tr><td>MLP c_proj</td><td>3.4-8.3</td><td>384</td></tr>
+    <tr><td>lm_head</td><td>15.7</td><td>384</td></tr>
+    <tr><td>Embeddings</td><td>16-25</td><td>384</td></tr>
+</table>
+
+<div style="max-width:700px;margin:20px auto;"><canvas id="chartGradientRank"></canvas></div>
+
+<p>Value projections have <strong>rank-1 gradients</strong>. The gradient signal lives in a single direction out of 384 possible dimensions. Muon orthogonalizes this into a full-rank update, which means it's amplifying 383 noise directions for every 1 signal direction in these layers.</p>
+
+<div class="callout">
+This is the strongest lead for future work: a rank-aware Muon variant that adapts orthogonalization strength to gradient rank. Low-rank layers (c_v) need less orthogonalization, not more.
+</div>
+
+<h2>The full measurement setup</h2>
+
+<p>Five representative layers were probed, chosen to cover different shapes and positions in the network:</p>
+
+<details><summary>Code: layer selection and optimizer configs</summary>
+<pre><code># 5M-param GPT with 4 blocks, d_model=256, d_ff=1024, vocab=4096
+# Layers sampled across the network:
+FOCUS_LAYERS = [
+    "blocks.0.attn.qkv.weight",   # (768, 256)  early attn
+    "blocks.1.mlp.up.weight",      # (1024, 256) early MLP
+    "blocks.2.attn.proj.weight",   # (256, 256)  mid attn
+    "blocks.3.mlp.down.weight",    # (256, 1024) late MLP
+    "lm_head.weight",              # (4096, 256) output head
+]
+
+# Optimizer configs:
+# SGD:    lr=0.1, momentum=0.9
+# Adam:   lr=1e-3, weight_decay=0
+# Muon:   lr=0.02, momentum=0.95, alpha=0.0 (pure Muon)
+#         2D params get Muon, others get Adam auxiliary
+# SpectraMuon: same but alpha=0.4 (spectral reshaping)
+
+# 500 steps, batch=64, seq=128, measurements every 50 steps
+# after 50-step warmup. Same seed (42), same data for all.
+</code></pre>
+</details>
+
+<details><summary>Code: per-layer results table (rank, condition, alignment, on-axis fraction)</summary>
+<pre><code># From print_summary() — Table 1 output format.
+# Averaged over last 3 measurements for stability.
+#
+# EffLR   = ||update|| / ||gradient|| (effective learning rate)
+# Align   = cosine(gradient, update)
+# Rank_g  = participation ratio of gradient SVs
+# Rank_u  = participation ratio of update SVs
+# OnAxis  = fraction of update energy in gradient's singular basis
+# Cond_g  = condition number of gradient
+# Cond_u  = condition number of update
+
+# Example output (from the experiment):
+#
+# -- b0.a.qkv --
+#  Optim       EffLR   Align  Rank_g  Rank_u  OnAxis   Cond_g   Cond_u
+#  sgd        0.0989   0.998    18.2    18.3   0.984    143.2    131.5
+#  adam       0.0040   0.413    17.8    11.2   0.621   8947.3  28371.4
+#  muon       0.0189   0.510    18.1   177.6   0.087      6.3      7.2
+#  spectra    0.0166   0.487    18.0   145.3   0.098      8.1      9.8
+#
+# -- lm_head --
+#  sgd        0.0998   0.999    49.6    49.8   0.997     28.1     27.3
+#  adam       0.0018   0.424    50.1    60.3   0.543     30.2     44.7
+#  muon       0.0194   0.362    49.8   164.8   0.041      6.8      8.4
+#  spectra    0.0171   0.351    50.0   152.1   0.048      7.5      9.1
+</code></pre>
+</details>
+
+<details><summary>Code: spectral reshaping table (amp_norm across the SV spectrum)</summary>
+<pre><code># Table 2: Normalized amplification across singular value spectrum.
+# amp_norm = per-direction LR / mean LR
+# Values > 1 = optimizer spends MORE effort here
+# Values < 1 = optimizer spends LESS effort
+#
+# Columns show: #1 (top SV), 25th percentile, 50th, 75th, last SV
+#
+# Example output:
+#
+# -- b0.a.qkv --
+#  Optim      #1(top)     25%     50%     75%    last  Pattern
+#  sgd         0.992   1.005   1.002   0.998   0.971  FLAT (uniform)
+#  adam         0.143   0.387   0.721   1.482   3.847  INVERTS (boosts weak dirs)
+#  muon         0.082   0.264   0.598   1.621   4.912  INVERTS (boosts weak dirs)
+#  spectra      0.094   0.301   0.642   1.543   4.371  INVERTS (boosts weak dirs)
+#
+# Key observation: SGD is flat — it applies the same LR to all
+# directions. Adam and Muon both invert — they suppress the top
+# singular direction (amp=0.08-0.14) and boost the bottom
+# direction (amp=3.8-4.9). But Muon produces a FULL-RANK update
+# while Adam's update is still low-rank.
+</code></pre>
+</details>
+
+<h2>Muon on real data</h2>
+
+<p>On 73M nanochat with FineWeb-Edu, comparing Muon against Adam:</p>
+
+<table>
+    <tr><th>Optimizer</th><th>Loss</th><th>SNR</th><th>Dist from Init</th><th>Alignment</th></tr>
+    <tr><td>Muon+AdamW (default)</td><td>4.97</td><td>0.58</td><td>59,722</td><td>0.19</td></tr>
+    <tr><td>AdamW (lr=1e-3)</td><td>5.58</td><td>0.78</td><td>323</td><td>0.33</td></tr>
+    <tr><td>AdamW (lr=3e-4)</td><td>6.04</td><td>0.85</td><td>158</td><td>0.36</td></tr>
+    <tr><td>Muon+AdamW (no WD)</td><td>4.90</td><td>0.50</td><td>59,943</td><td>0.13</td></tr>
+</table>
+
+<p>Muon travels <strong>185x farther</strong> from initialization than Adam (59,722 vs 323 parameter-space units). Counterintuitively, Muon has <em>lower</em> per-step SNR and alignment &mdash; it's noisier per step, but each step is more efficient because it moves across all directions simultaneously.</p>
+
+<h2>Spectral flow: how singular values evolve during training</h2>
+
+<p>A separate experiment tracked the singular values of weight matrices at every 5 training steps across 1500 steps of AdamW, measuring level repulsion, conservation laws, and phase transitions in the spectrum.</p>
+
+<details><summary>Code: computing SVD and conserved spectral quantities at each step</summary>
+<pre><code># From exp1_spectral_flow.py
+# Full SVD in float64 for numerical precision
+
+def compute_svd(weight_tensor):
+    """Compute full SVD of a weight matrix in float64."""
+    W = weight_tensor.detach().to(dtype=torch.float64)
+    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+    return S.numpy()
+
+def compute_conserved_quantities(S):
+    """Compute various spectral quantities from singular values."""
+    return {
+        "frobenius_sq": np.sum(S ** 2),          # ||W||_F^2
+        "nuclear_norm": np.sum(S),                # sum(sigma_i)
+        "log_det": np.sum(np.log(S + 1e-30)),    # ~ log(det)
+        "spectral_norm": np.max(S),               # largest SV
+        "condition_number": np.max(S) / (np.min(S) + 1e-30),
+        "entropy": -np.sum((S/np.sum(S)) * np.log(S/np.sum(S) + 1e-30)),
+        "effective_rank": np.exp(
+            -np.sum((S**2/np.sum(S**2))
+                    * np.log(S**2/np.sum(S**2) + 1e-30))),
+        "sum_sv4": np.sum(S ** 4),                # 4th moment
+        "sum_inv_sv": np.sum(1.0 / (S + 1e-30)), # sum(1/sigma_i)
+    }
+
+# Measured every 5 steps across 1500 steps of training.
+# Tracked 4 layers: block 0 attn, block 0 MLP, block 3 attn,
+# block 3 MLP. All SVD computed in float64 on CPU.
+</code></pre>
+</details>
+
+<details><summary>Code: nearest-neighbor spacing and level repulsion analysis</summary>
+<pre><code># Level repulsion: do singular values avoid each other
+# like eigenvalues of random matrices (GOE)?
+# Or are they independent like Poisson?
+
+def nearest_neighbor_spacings(singular_values):
+    """
+    Compute nearest-neighbor spacing distribution.
+    First unfold the spectrum (normalize to unit mean spacing).
+    """
+    sv_sorted = np.sort(singular_values)[::-1]  # descending
+    spacings = np.abs(np.diff(sv_sorted))
+    if len(spacings) == 0 or np.mean(spacings) < 1e-15:
+        return spacings, np.array([])
+    # Unfold: normalize spacings to mean 1
+    spacings_unfolded = spacings / np.mean(spacings)
+    return spacings, spacings_unfolded
+
+# Brody parameter estimation:
+# beta=0 means Poisson (independent eigenvalues)
+# beta=1 means GOE (level repulsion)
+# Uses variance of unfolded spacings:
+#   Var(s) = (4-pi)/pi ~ 0.273 for GOE
+#   Var(s) = 1 for Poisson
+var_goe = (4 - np.pi) / np.pi  # ~0.273
+var_poisson = 1.0
+beta_est = np.clip(
+    1.0 - (var_s - var_goe) / (var_poisson - var_goe + 1e-15),
+    0, 2
+)
+
+# Also ran Kolmogorov-Smirnov tests against both distributions:
+from scipy.stats import kstest
+ks_goe, p_goe = kstest(spacings_unf,
+    lambda x: 1 - np.exp(-np.pi * x**2 / 4))
+ks_poi, p_poi = kstest(spacings_unf, 'expon', args=(0, 1))
+</code></pre>
+</details>
+
+<details><summary>Code: detecting spectral phase transitions</summary>
+<pre><code>def detect_phase_transitions(all_sv_history, steps):
+    """
+    Look for sharp changes in the spectral distribution.
+    Multiple indicators:
+    1. Rate of change of effective rank
+    2. Jump in spectral entropy
+    3. Change in distribution shape (kurtosis of SVs)
+    """
+    for i in range(n_steps):
+        S = sv_series[i]
+        S2 = S ** 2
+        p = S2 / np.sum(S2)
+        eff_rank[i] = np.exp(-np.sum(p * np.log(p + 1e-30)))
+
+        mu = np.mean(S)
+        std = np.std(S) + 1e-30
+        kurtosis[i] = np.mean(((S - mu) / std) ** 4) - 3
+
+        p_sv = S / np.sum(S)
+        spectral_entropy[i] = -np.sum(
+            p_sv * np.log(p_sv + 1e-30))
+
+        top_sv_ratio[i] = S[0] / np.sum(S)
+
+    # Composite transition score from derivatives:
+    d_eff_rank = np.gradient(eff_rank)
+    d_kurtosis = np.gradient(kurtosis)
+    d_entropy  = np.gradient(spectral_entropy)
+
+    transition_score = (
+        np.abs(d_eff_rank) / (np.std(d_eff_rank) + 1e-15) +
+        np.abs(d_kurtosis) / (np.std(d_kurtosis) + 1e-15) +
+        np.abs(d_entropy)  / (np.std(d_entropy)  + 1e-15)
+    )
+    # Peaks in transition_score = candidate phase transitions
+</code></pre>
+</details>
+
+<details><summary>Code: Marchenko-Pastur comparison &mdash; how far weights depart from random</summary>
+<pre><code># Compare final weight spectra to the Marchenko-Pastur law
+# (the theoretical SV distribution of random matrices).
+# SVs that escape the MP bulk = learned structure.
+
+W = get_weight(name)
+m, n = W.shape[0], W.shape[1]
+gamma = min(m, n) / max(m, n)  # aspect ratio
+
+# MP bounds for sv^2 / (variance * max(m,n)):
+lambda_plus  = (1 + np.sqrt(gamma)) ** 2
+lambda_minus = (1 - np.sqrt(gamma)) ** 2
+
+# For init scale 0.02:
+var_init = 0.02 ** 2
+final_sv_sq_norm = sv[-1]**2 / (var_init * max(m, n))
+
+n_above = np.sum(final_sv_sq_norm > lambda_plus * 1.1)
+# n_above / total_sv = fraction of SVs that escaped
+# the random bulk during training = "learned directions"
+</code></pre>
+</details>
+
+<div class="page-nav">
+    <a href="landscape.html">&larr; Prev: Loss Landscape</a>
+    <a href="scaling.html">Next: Scaling Laws &rarr;</a>
+</div>
+
+<footer>
+    <p>Built with real experiments, not theory.<br>February 2026</p>
+</footer>
+
+</div>
+
+<script>
+// Set global Chart.js font
+Chart.defaults.font.family = "'Courier Prime', monospace";
+
+// Theme colors
+const COLOR_MUON = '#8b4513';
+const COLOR_ADAM = '#5b3a8c';
+const COLOR_SGD = '#6b6560';
+const COLOR_SPECTRA = '#8b6914';
+const COLOR_GREEN = '#2d6a30';
+const COLOR_RED = '#a82020';
+const COLOR_GRID = '#d4cfc4';
+
+// --- Chart 1: Update Effective Rank ---
+new Chart(document.getElementById('chartEffectiveRank'), {
+    type: 'bar',
+    data: {
+        labels: ['Muon', 'Adam', 'SGD'],
+        datasets: [{
+            label: 'Effective Rank',
+            data: [160, 35, 31],
+            backgroundColor: [COLOR_MUON, COLOR_ADAM, COLOR_SGD],
+            borderColor: [COLOR_MUON, COLOR_ADAM, COLOR_SGD],
+            borderWidth: 1
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Update Effective Rank (out of 256)',
+                font: { size: 16, weight: 'bold' }
+            },
+            legend: {
+                display: false
+            },
+            annotation: {
+                annotations: {
+                    maxRankLine: {
+                        type: 'line',
+                        yMin: 256,
+                        yMax: 256,
+                        borderColor: '#333',
+                        borderWidth: 2,
+                        borderDash: [6, 4],
+                        label: {
+                            display: true,
+                            content: 'Max rank = 256',
+                            position: 'end'
+                        }
+                    }
+                }
+            }
+        },
+        scales: {
+            y: {
+                beginAtZero: true,
+                max: 280,
+                grid: { color: COLOR_GRID },
+                title: {
+                    display: true,
+                    text: 'Effective Rank'
+                }
+            },
+            x: {
+                grid: { display: false }
+            }
+        }
+    },
+    plugins: [{
+        id: 'maxRankLine',
+        afterDraw: function(chart) {
+            var ctx = chart.ctx;
+            var yAxis = chart.scales.y;
+            var xAxis = chart.scales.x;
+            var y = yAxis.getPixelForValue(256);
+            ctx.save();
+            ctx.beginPath();
+            ctx.setLineDash([6, 4]);
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+            ctx.moveTo(xAxis.left, y);
+            ctx.lineTo(xAxis.right, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#333';
+            ctx.font = "12px 'Courier Prime', monospace";
+            ctx.textAlign = 'right';
+            ctx.fillText('max rank = 256', xAxis.right, y - 6);
+            ctx.restore();
+        }
+    }]
+});
+
+// --- Chart 2: Step Efficiency ---
+new Chart(document.getElementById('chartStepEfficiency'), {
+    type: 'bar',
+    data: {
+        labels: ['Muon', 'Adam', 'SGD'],
+        datasets: [{
+            label: '\u0394loss per step',
+            data: [0.73, 0.21, 0.03],
+            backgroundColor: [COLOR_MUON, COLOR_ADAM, COLOR_SGD],
+            borderColor: [COLOR_MUON, COLOR_ADAM, COLOR_SGD],
+            borderWidth: 1
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: '\u0394loss per step',
+                font: { size: 16, weight: 'bold' }
+            },
+            legend: {
+                display: false
+            }
+        },
+        scales: {
+            y: {
+                beginAtZero: true,
+                grid: { color: COLOR_GRID },
+                title: {
+                    display: true,
+                    text: '\u0394loss / step'
+                }
+            },
+            x: {
+                grid: { display: false }
+            }
+        }
+    }
+});
+
+// --- Chart 3: Spectral Reshaping Pattern ---
+(function() {
+    var labels = ['Top SV', '25%', '50%', '75%', 'Bottom SV'];
+
+    // SGD: flat at ~1.0
+    var sgdData = [0.992, 1.005, 1.002, 0.998, 0.971];
+
+    // Adam: from ~0.14 (top) to ~3.85 (bottom)
+    var adamData = [0.143, 0.387, 0.721, 1.482, 3.847];
+
+    // Muon: from ~0.08 (top) to ~4.91 (bottom)
+    var muonData = [0.082, 0.264, 0.598, 1.621, 4.912];
+
+    new Chart(document.getElementById('chartSpectralReshaping'), {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'SGD',
+                    data: sgdData,
+                    borderColor: COLOR_SGD,
+                    backgroundColor: COLOR_SGD,
+                    borderWidth: 2,
+                    borderDash: [6, 4],
+                    pointRadius: 4,
+                    pointStyle: 'circle',
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: 'Adam',
+                    data: adamData,
+                    borderColor: COLOR_ADAM,
+                    backgroundColor: COLOR_ADAM,
+                    borderWidth: 2,
+                    pointRadius: 4,
+                    pointStyle: 'circle',
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: 'Muon',
+                    data: muonData,
+                    borderColor: COLOR_MUON,
+                    backgroundColor: COLOR_MUON,
+                    borderWidth: 2,
+                    pointRadius: 4,
+                    pointStyle: 'circle',
+                    fill: false,
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Spectral Reshaping: per-direction amplification',
+                    font: { size: 16, weight: 'bold' }
+                },
+                legend: {
+                    labels: {
+                        usePointStyle: true
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: { color: COLOR_GRID },
+                    title: {
+                        display: true,
+                        text: 'Normalized amplification (amp_norm)'
+                    }
+                },
+                x: {
+                    grid: { color: COLOR_GRID },
+                    title: {
+                        display: true,
+                        text: 'Singular value index'
+                    }
+                }
+            }
+        },
+        plugins: [{
+            id: 'neutralLine',
+            afterDraw: function(chart) {
+                var ctx = chart.ctx;
+                var yAxis = chart.scales.y;
+                var xAxis = chart.scales.x;
+                var y = yAxis.getPixelForValue(1.0);
+                ctx.save();
+                ctx.beginPath();
+                ctx.setLineDash([6, 4]);
+                ctx.strokeStyle = COLOR_RED;
+                ctx.lineWidth = 1.5;
+                ctx.moveTo(xAxis.left, y);
+                ctx.lineTo(xAxis.right, y);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.fillStyle = COLOR_RED;
+                ctx.font = "11px 'Courier Prime', monospace";
+                ctx.textAlign = 'left';
+                ctx.fillText('neutral (1.0)', xAxis.left + 4, y - 6);
+                ctx.restore();
+            }
+        }]
+    });
+})();
+
+// --- Chart 4: Gradient Rank by Layer Type ---
+(function() {
+    var layerLabels = ['c_v', 'c_q / c_k', 'c_proj', 'mlp.c_fc', 'mlp.c_proj', 'lm_head', 'embeddings'];
+    var rankValues = [1.3, 4.7, 4.2, 4.9, 5.9, 15.7, 20.5];
+    var barColors = layerLabels.map(function(label) {
+        return label === 'c_v' ? COLOR_RED : COLOR_MUON;
+    });
+
+    new Chart(document.getElementById('chartGradientRank'), {
+        type: 'bar',
+        data: {
+            labels: layerLabels,
+            datasets: [{
+                label: 'Effective Rank',
+                data: rankValues,
+                backgroundColor: barColors,
+                borderColor: barColors,
+                borderWidth: 1
+            }]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: 'Gradient Effective Rank (73M nanochat)',
+                    font: { size: 16, weight: 'bold' }
+                },
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                x: {
+                    beginAtZero: true,
+                    grid: { color: COLOR_GRID },
+                    title: {
+                        display: true,
+                        text: 'Effective Rank'
+                    }
+                },
+                y: {
+                    grid: { display: false }
+                }
+            }
+        }
+    });
+})();
+</script>
+</body>
+</html>

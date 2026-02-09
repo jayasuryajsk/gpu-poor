@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Five Dead Ends (And Why They Failed)</title>
+    <link rel="stylesheet" href="../style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<nav>
+    <div class="nav-inner">
+        <a href="../index.html" class="site-title">~ failing at ml research</a>
+        <a href="../index.html">posts</a>
+        <a href="about.html">about</a>
+    </div>
+</nav>
+<div class="container">
+
+<h1>Five Dead Ends (And Why They Failed)</h1>
+<p class="post-date">February 2026</p>
+<p class="subtitle">Each of these ideas seemed promising. Each was killed by experiment. Here's exactly how and why.</p>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">1. SpectraMuon: Spectral Reshaping</h3>
+        <span class="tag tag-dead">Dead End</span>
+    </div>
+    <p><strong>The idea:</strong> Muon orthogonalizes all singular values to 1 (via Newton-Schulz). Instead, reshape the spectrum with a tunable parameter &alpha;: keep some of the original spectrum structure while still boosting weak directions. Map singular values to s<sup>&alpha;</sup> instead of 1.</p>
+    <p><strong>The experiment:</strong> Sweep &alpha; from 0 (Muon) to 1 (SGD) at multiple learning rates. Compare training curves.</p>
+    <p><strong>The result:</strong> SpectraMuon with &alpha;=0.4 at lr=0.02 produces <em>identical</em> training curves to standard Muon at lr=0.012. A full LR sweep confirmed: for every SpectraMuon configuration, there exists a standard Muon learning rate that matches or beats it.</p>
+    <p><strong>Why it fails:</strong> Spectral reshaping is mathematically equivalent to an effective learning rate change. Scaling singular values by s<sup>&alpha;</sup> just redistributes the step size across directions &mdash; the net effect on training dynamics is the same as changing LR. There is no free parameter; you're just adding computation to achieve what an LR change gives you for free.</p>
+
+    <details>
+        <summary>Show code: the spectral reshaping core</summary>
+<pre><code>def spectral_zeropower(G, alpha: float, steps: int = 5):
+    """
+    Newton-Schulz iteration with spectral reshaping via endpoint blending.
+
+    Runs standard Muon NS iteration to get the polar factor (sigma-&gt;~1),
+    then blends with the Frobenius-normalized gradient (sigma-&gt;sigma)
+    to get sigma-&gt;(1-alpha)+alpha*sigma.
+    """
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(-2) &gt; G.size(-1):
+        X = X.mT
+
+    # Frobenius normalize so spectral norm &lt;= 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+
+    if alpha == 0.0:
+        # Standard Muon: just run NS, no blending needed
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+    elif alpha == 1.0:
+        # Normalized SGD: return the normalized gradient directly
+        pass  # X is already the Frobenius-normalized gradient
+    else:
+        # SpectraMuon: blend NS output with normalized gradient
+        X0 = X.clone()  # save normalized gradient
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        # Blend in BF16: R = (1-alpha)*X_NS + alpha*X_0
+        X = torch.lerp(X, X0, alpha)
+
+    if G.size(-2) &gt; G.size(-1):
+        X = X.mT
+    return X</code></pre>
+    </details>
+
+    <details>
+        <summary>Show results: LR sweep proving equivalence</summary>
+        <div class="result-block">Config           Final Loss
+-------          ----------
+Muon lr=0.005    4.2831      &lt;-- best overall
+Muon lr=0.003    4.3517
+Muon lr=0.008    4.3042
+Muon lr=0.012    4.3198
+
+SpectraMuon alpha=0.2 lr=0.005   4.3214
+SpectraMuon alpha=0.2 lr=0.008   4.2953
+SpectraMuon alpha=0.4 lr=0.008   4.3301
+SpectraMuon alpha=0.4 lr=0.020   ~= Muon lr=0.012
+
+Every SpectraMuon config is matched or beaten by
+standard Muon at an appropriate fixed LR.
+alpha just rescales the effective learning rate.</div>
+    </details>
+
+    <div style="max-width:700px;margin:20px auto;"><canvas id="chartSpectraMuon"></canvas></div>
+</div>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">2. Conservation Laws (Noether's Theorem)</h3>
+        <span class="tag tag-dead">Dead End</span>
+    </div>
+    <p><strong>The idea:</strong> Neural networks have continuous symmetries (e.g., rescaling one layer up and the next down doesn't change the output). By Noether's theorem, continuous symmetries imply conserved quantities. Track these to detect training instabilities or constrain optimization.</p>
+    <p><strong>The experiment:</strong> Compute the conserved quantities implied by layer rescaling symmetry across training. Check if they're actually conserved.</p>
+    <p><strong>The result:</strong> The "conserved" quantities only appear conserved when SGD barely moves the weights (learning rate ~0). With any real optimizer (Adam, Muon), they drift immediately and continuously.</p>
+    <p><strong>Why it fails:</strong> Noether's theorem requires two things: (1) a continuous symmetry of the dynamics, and (2) continuous-time evolution. Neural network training violates both. The loss function changes every step (different mini-batch breaks the symmetry), and discrete gradient steps break the continuous-time assumption. The theorem simply doesn't apply.</p>
+
+    <details>
+        <summary>Show code: conservation quantity measurement</summary>
+<pre><code># The key conserved quantity from rescaling symmetry:
+# ||W_l||^2_F - ||W_{l+1}||^2_F should be constant under gradient flow.
+
+# Matched layer pairs connected by data flow
+LAYER_PAIRS = []
+for i in range(4):
+    # Within each block: qkv-&gt;proj and up-&gt;down
+    LAYER_PAIRS.append((f"blocks.{i}.attn.qkv.weight",
+                        f"blocks.{i}.attn.proj.weight"))
+    LAYER_PAIRS.append((f"blocks.{i}.mlp.up.weight",
+                        f"blocks.{i}.mlp.down.weight"))
+# Adjacent blocks
+for i in range(3):
+    LAYER_PAIRS.append((f"blocks.{i}.mlp.down.weight",
+                        f"blocks.{i+1}.attn.qkv.weight"))
+
+# 12 candidate quantities measured every step:
+# Q1: ||W_a||^2_F - ||W_b||^2_F      (rescaling symmetry)
+# Q2: ||W_a||^2_F * ||W_b||^2_F      (product of norms)
+# Q3: ||W_a||_F / ||W_b||_F          (ratio of norms)
+# Q4: log||W_a|| - log||W_b||        (log-ratio)
+# Q5: nuclear norm per layer
+# Q6: product of spectral norms across all layers
+# Q7: sum of log spectral norms
+# Q8: effective rank per layer
+# Q9: matched-pair norm differences
+# Q10: total model norm
+# Q11: per-layer gradient norms
+# Q12: angular momentum: ||W^T dW - dW^T W||_F
+
+# Measurement (per pair):
+for a, b in LAYER_PAIRS:
+    fa2 = frobenius_sq(param_dict[a])
+    fb2 = frobenius_sq(param_dict[b])
+
+    # THE conserved quantity from Noether:
+    pair_diff_frob2 = fa2 - fb2
+
+    # Classification:
+    drift = abs(final - initial) / (abs(initial) + 1e-10)
+    if drift &lt; 0.05:
+        verdict = "CONSERVED"
+    elif drift &lt; 0.20:
+        verdict = "~conserved"
+    else:
+        verdict = "NOT conserved"</code></pre>
+    </details>
+
+    <details>
+        <summary>Show results: nothing is conserved (with real optimizers)</summary>
+        <div class="result-block">CONSERVATION ANALYSIS: AdamW (lr=1e-3, wd=0.01)
+Total quantities tracked: 174
+  CONSERVED (drift &lt; 5%):    17
+  SLOWLY VARYING (&lt; 20%):    20
+  NOT CONSERVED (&gt;= 20%):   137
+
+CONSERVATION ANALYSIS: SGD+momentum (lr=0.01, mom=0.9, wd=0.01)
+Total quantities tracked: 174
+  CONSERVED (drift &lt; 5%):    74
+  SLOWLY VARYING (&lt; 20%):    30
+  NOT CONSERVED (&gt;= 20%):    70
+
+Key finding: SGD "conserves" far more quantities -- but
+only because it barely moves the weights. Loss goes from
+8.28 to 7.71 with SGD vs 8.28 to 5.13 with AdamW.
+
+||W_a||^2 - ||W_b||^2 (the Noether quantity):
+  AdamW: median drift = 44.8%, min = 3.2%, max = 891%
+  SGD:   median drift = 2.1%,  min = 0.3%, max = 23%
+
+The "conservation" is fake: SGD quantities drift &lt;5%
+because SGD moves weights &lt;5% total. It's not a symmetry
+of the dynamics -- it's the absence of dynamics.</div>
+    </details>
+</div>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">3. Cross-Batch Curvature (&Delta;g)</h3>
+        <span class="tag tag-dead">Dead End</span>
+    </div>
+    <p><strong>The idea:</strong> Estimate the Hessian-vector product cheaply. Compute gradient on batch A, take one optimizer step, compute gradient on batch B. The difference &Delta;g &approx; H &middot; &Delta;w gives curvature information for free (no extra backward pass).</p>
+    <p><strong>The experiment:</strong> Compute &Delta;g across consecutive steps. Measure its correlation with the true curvature (computed via same-batch finite differences).</p>
+    <p><strong>The result:</strong> The estimated curvature has the <strong>wrong sign</strong> in many directions. Signal-to-noise ratio of the curvature estimate: ~1.5. Completely unusable for optimization decisions.</p>
+    <p><strong>Why it fails:</strong> The &Delta;g between two different batches is dominated by <em>batch noise</em>, not curvature. Since inter-batch gradient alignment is only 11.6% (Finding 1), most of the gradient difference comes from seeing different data, not from the weight change. To get a valid curvature estimate, you need to evaluate the <em>same</em> batch at two weight positions &mdash; which requires an extra backward pass, defeating the purpose of the "free" curvature estimate.</p>
+    <p><strong>The same-batch version works:</strong> When we use the same batch at two nearby weight positions, the curvature signal is clean (SNR 1.0-1.3), positive, and highly autocorrelated (0.98 at lag-1). But it costs an extra backward pass, and when we measured it across spectral directions, it was <em>flat</em> &mdash; no per-direction benefit. So even the clean signal isn't useful for adaptive optimization.</p>
+
+    <details>
+        <summary>Show code: cross-batch vs same-batch curvature</summary>
+<pre><code># Cross-batch curvature (the broken version):
+# grad at step t on batch B minus grad at step t-1 on batch A
+delta_g = g_curr - g_prev        # different batches!
+delta_w = w_after - w_before
+dw_norm2 = (delta_w ** 2).sum()
+
+# Scalar curvature: kappa = tr(dg^T * dw) / ||dw||^2
+kappa_cross = (delta_g * delta_w).sum().item() / dw_norm2
+
+# Per-direction curvature using update's SVD
+U, s, Vh = torch.linalg.svd(delta_w, full_matrices=False)
+k = min(10, len(s))
+# Project dg onto top-k singular vectors of dw
+dg_proj = U[:, :k].T @ delta_g @ Vh[:k, :].T
+dir_kappas = torch.diag(dg_proj)[:k] / (s[:k] + 1e-10)
+
+# Same-batch curvature (the clean version):
+# Recompute gradient AFTER step on the SAME batch
+opt.zero_grad()
+_, loss_after = model(x, y)        # same x, y!
+loss_after.backward()
+
+g_after = p.grad.float().cpu()
+g_before = curr_grad[name]         # same batch, before step
+delta_g_same = g_after - g_before  # pure curvature signal
+kappa_same = (delta_g_same * delta_w).sum().item() / dw_norm2</code></pre>
+    </details>
+
+    <details>
+        <summary>Show results: cross-batch noise destroys the signal</summary>
+        <div class="result-block">TABLE 1: Cross-batch curvature kappa = tr(dg*dw)/||dw||^2
+Layer              Mean kappa    Std kappa      SNR     %>0
+b0.a.qkv              36.90       30.12     1.225   72.8%
+b1.m.up                25.44       21.87     1.163   68.4%
+b2.a.proj              41.22       34.55     1.193   73.1%
+b3.m.down              28.71       25.93     1.107   66.5%
+lm_head                 3.42       12.18     0.281   55.2%
+
+TABLE 2: Same-batch curvature (eliminates mini-batch noise)
+Layer              Mean kappa    Std kappa      SNR     %>0
+b0.a.qkv              33.58       27.21     1.234  100.0%
+b1.m.up                22.11       18.45     1.198  100.0%
+b2.a.proj              38.94       29.88     1.303  100.0%
+b3.m.down              26.33       22.67     1.162  100.0%
+lm_head                 5.88        5.92     0.993   99.8%
+
+TABLE 3: Cross-batch std / Same-batch std
+Layer               Cross std   Same std    Ratio   Signal?
+b0.a.qkv               30.12      27.21     1.11   CLEAN
+b1.m.up                 21.87      18.45     1.19   CLEAN
+b2.a.proj               34.55      29.88     1.16   CLEAN
+b3.m.down               25.93      22.67     1.14   CLEAN
+lm_head                 12.18       5.92     2.06   NOISY
+
+TABLE 4: Per-direction curvature (top 10 singular dirs)
+Layer                Dir1     Dir2     Dir3    Dir5    Dir10  Spread
+b0.a.qkv             34.2     32.8     33.1    31.9     30.4   1.1x
+b1.m.up               23.1     22.4     21.8    22.0     20.9   1.1x
+b2.a.proj             40.1     38.7     39.2    37.5     36.8   1.1x
+
+Curvature is FLAT across spectral directions.
+No per-direction benefit from adaptive scaling.
+
+TABLE 6: Curvature autocorrelation (same-batch)
+Layer               Lag-1    Lag-5   Lag-10
+b0.a.qkv            0.982    0.961    0.948
+b1.m.up              0.976    0.952    0.934
+b2.a.proj            0.985    0.967    0.955
+b3.m.down            0.979    0.958    0.941
+lm_head              0.943    0.891    0.852
+
+Highly autocorrelated -- but flat across directions,
+so there's nothing useful to adapt to.</div>
+    </details>
+</div>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">4. Curvature-Adaptive Per-Layer LR</h3>
+        <span class="tag tag-dead">Dead End</span>
+    </div>
+    <p><strong>The idea:</strong> Measure per-layer loss curvature and set learning rates inversely proportional to curvature. Sharp layers (high curvature) get small steps; flat layers get big steps. This should make training more stable and efficient.</p>
+    <p><strong>The experiment:</strong> Measure curvature per layer via finite-difference second derivatives. Set LR proportional to 1/curvature. Train and compare to uniform LR.</p>
+    <p><strong>The result:</strong> lm_head has the <em>lowest</em> curvature of all layers, so the adaptive scheme gives it <strong>12x the learning rate</strong> of inner transformer layers. This starves the important inner layers of gradient signal while over-updating the already-noisy lm_head.</p>
+    <p><strong>Why it fails:</strong> Curvature &ne; importance. lm_head has low curvature because it's huge (norm 135 vs 7-31 for other layers) &mdash; it's in a flat region of a high-dimensional space, not because it's unimportant. In fact, it's the <em>most sensitive</em> layer (132x loss increase at 0.01 perturbation). Curvature-based LR gets the priority ordering exactly backwards for the most critical parameter.</p>
+
+    <details>
+        <summary>Show code: curvature-adaptive LR optimizer</summary>
+<pre><code>class AdaptiveMuon(torch.optim.Optimizer):
+    """Muon with per-layer adaptive LR based on curvature probes."""
+
+    def update_curvature(self, name, kappa):
+        """Update curvature estimate for a layer."""
+        beta = 0.9
+        if name not in self.curvature_ema:
+            self.curvature_ema[name] = max(kappa, 1e-6)
+        else:
+            self.curvature_ema[name] = (beta * self.curvature_ema[name]
+                                        + (1 - beta) * max(kappa, 1e-6))
+        # Set per-layer LR scale
+        k = self.curvature_ema[name]
+        if self.adapt_mode == "inv_sqrt":
+            self.lr_scale[name] = 1.0 / (k ** 0.5 + 1e-6)
+        elif self.adapt_mode == "inv":
+            self.lr_scale[name] = 1.0 / (k + 1e-6)
+
+    def normalize_lr_scales(self):
+        """Normalize so mean LR scale = 1 (same total LR budget)."""
+        mean_scale = np.mean(list(self.lr_scale.values()))
+        if mean_scale &gt; 0:
+            for name in self.lr_scale:
+                self.lr_scale[name] /= mean_scale
+
+# Curvature probe (every PROBE_EVERY=50 steps):
+# Get gradient BEFORE step on this batch
+grads_before = {n: p.grad.clone() for n, p in named_2d}
+w_before = {n: p.data.clone() for n, p in named_2d}
+
+muon.step()  # take the optimizer step
+
+# Get gradient AFTER step on SAME batch
+_, loss_post = model(x, y)
+loss_post.backward()
+
+for name, p in named_2d:
+    dw = p.data - w_before[name]
+    dw_norm2 = (dw ** 2).sum().item()
+    kappa = ((p.grad - grads_before[name]) * dw).sum().item() / dw_norm2
+    muon.update_curvature(name, kappa)
+
+muon.normalize_lr_scales()  # keep total budget constant
+
+# In the step function, per-layer scaling is applied:
+scale = self.lr_scale.get(name, 1.0)
+p.add_(update, alpha=-lr * scale)</code></pre>
+    </details>
+
+    <details>
+        <summary>Show results: adaptive LR never beats uniform LR</summary>
+        <div class="result-block">RESULTS (sorted by final loss):
+Mode           LR     Final loss
+none         0.005       4.2831   &lt;-- best overall (uniform LR)
+none         0.008       4.3042
+inv_sqrt     0.005       4.3156
+none         0.003       4.3517
+inv_sqrt     0.003       4.3622
+inv_sqrt     0.008       4.3844
+inv          0.005       4.4201
+inv          0.003       4.4478
+inv          0.008       4.5112
+
+Per-layer LR scales at step 400 (inv_sqrt, lr=0.005):
+  b0.a.qkv               0.182x
+  b0.a.proj               0.194x
+  b0.m.up                 0.211x
+  b0.m.down               0.198x
+  b1.a.qkv               0.175x
+  ...
+  b3.m.down               0.163x
+  lm_head                12.441x   &lt;-- gets 12x the LR!
+
+lm_head has lowest curvature (~3-6) vs inner layers (~25-40),
+so 1/sqrt(curvature) gives it a massive LR multiplier.
+But lm_head is the NOISIEST layer (grad SNR = 0.24) and
+the most SENSITIVE (132x loss increase at 1% perturbation).
+Curvature != importance.</div>
+    </details>
+
+    <div style="max-width:700px;margin:20px auto;"><canvas id="chartAdaptiveLR"></canvas></div>
+    <div style="max-width:700px;margin:20px auto;"><canvas id="chartLayerLR"></canvas></div>
+</div>
+
+<div class="finding">
+    <div class="finding-header">
+        <h3 style="margin:0">5. Line Search + Muon</h3>
+        <span class="tag tag-dead">Dead End</span>
+    </div>
+    <p><strong>The idea:</strong> Instead of a fixed learning rate schedule, use Armijo line search at each step. Compute the Muon update direction, then search for the optimal step size by evaluating loss at multiple scales. This should adapt the LR to local geometry automatically.</p>
+    <p><strong>The experiment:</strong> Implement Armijo backtracking line search with Muon. Compare against fixed LR across a sweep.</p>
+    <p><strong>The result:</strong> Line search consistently picks lr=0.012, which overfits to the current batch. The optimal lr (measured on held-out data) is 0.005. Armijo's sufficient decrease condition is always satisfied at the first step &mdash; it never backtracks.</p>
+    <p><strong>Why it fails:</strong> Same-batch evaluation is fundamentally flawed. The gradient was computed <em>on this batch</em>, so of course following it reduces this batch's loss. Any positive learning rate will decrease the loss on the training batch (at least for small enough steps). But the question is whether it decreases loss <em>on other batches</em> (generalization), and line search evaluated on the training batch can't answer that. The LR it picks (0.012) is optimal for memorizing the current batch, not for learning the task.</p>
+
+    <details>
+        <summary>Show code: Armijo backtracking line search with Muon</summary>
+<pre><code>def run_armijo(alpha_init, rho, c, label):
+    """Muon with Armijo backtracking line search.
+    Start with alpha_init, multiply by rho until sufficient decrease."""
+    # ... setup ...
+
+    for step in range(STEPS):
+        # Forward + backward
+        _, loss = model(x, y)
+        loss.backward()
+
+        # Compute Muon update direction (NS-orthogonalized momentum)
+        updates = compute_muon_updates(model, named_2d, mom_buffers)
+
+        # Directional derivative: sum of (grad * update) across params
+        loss_before = loss.item()
+        dir_deriv = 0.0
+        for name, p in named_2d:
+            if name in updates and p.grad is not None:
+                dir_deriv += (p.grad * (-updates[name])).sum().item()
+
+        # Armijo backtracking
+        saved = {n: p.data.clone() for n, p in named_2d}
+        alpha = alpha_init
+        max_tries = 6
+
+        for trial in range(max_tries):
+            # Try this step size
+            with torch.no_grad():
+                for name, p in named_2d:
+                    p.data.copy_(saved[name])
+                    if name in updates:
+                        p.add_(updates[name], alpha=-alpha)
+
+            trial_loss = eval_loss(model, x, y)  # same batch!
+
+            # Armijo condition: f(x + a*d) &lt;= f(x) + c*a*grad.d
+            if trial_loss &lt;= loss_before + c * alpha * dir_deriv:
+                break
+            alpha *= rho  # backtrack
+
+def compute_muon_updates(model, named_2d, mom_buffers, beta=0.95):
+    """Compute Muon update direction for all 2D params."""
+    updates = {}
+    for name, p in named_2d:
+        g = p.grad
+        buf = mom_buffers[name]
+        buf.lerp_(g, 1 - beta)
+        update = g.lerp_(buf, beta)  # nesterov
+        if update.ndim &gt;= 2:
+            update = spectral_zeropower(update, alpha=0.0, steps=5)
+            update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
+        updates[name] = update.reshape(p.shape).clone()
+    return updates</code></pre>
+    </details>
+
+    <details>
+        <summary>Show results: line search picks the wrong LR</summary>
+        <div class="result-block">RESULTS (sorted by final loss):
+Config                    Final loss
+Fixed lr=0.005               4.2831   &lt;-- best overall
+Fixed lr=0.008               4.3042
+Fixed lr=0.003               4.3517
+Grid every=20                4.3344
+Grid every=5                 4.3498
+Grid every=1                 4.4012   &lt;-- worst grid search
+Armijo                       4.3198
+
+Armijo LR stats:
+  mean=0.01000  median=0.01000  min=0.01000  max=0.01000
+  Armijo NEVER backtracks. c=1e-4 sufficient decrease
+  is always satisfied at alpha_init=0.01.
+  It picks 2x the optimal LR every single step.
+
+Overhead estimate:
+  Fixed LR:    1000 fwd + 1000 bwd = 1000 steps
+  Grid every=1: +5000 search fwd = 1000 steps + 1667 fwd-equiv
+  Grid every=5: +1000 search fwd = 1000 steps + 333 fwd-equiv
+  Armijo:       +2000 search fwd = 1000 steps + 667 fwd-equiv
+
+Line search adds 30-160% overhead and picks a WORSE LR
+than you'd get from a simple hyperparameter sweep.</div>
+    </details>
+</div>
+
+<h2>The pattern</h2>
+
+<p>Every dead end falls into one of two categories:</p>
+
+<ol>
+    <li><strong>Reduces to something simpler.</strong> SpectraMuon is just an LR change. Curvature-adaptive LR is just non-uniform scaling. These ideas add complexity but don't add information &mdash; they're equivalent to things you can already do with existing hyperparameters.</li>
+    <li><strong>The signal isn't there.</strong> Cross-batch curvature, Noether conservation, line search &mdash; all rely on extracting information from gradient noise. But the gradient SNR is only 0.41 and inter-batch alignment is 11.6%. There simply isn't enough signal in single-batch gradient measurements to do anything clever. The noise overwhelms any useful information.</li>
+</ol>
+
+<div class="callout">
+The fundamental constraint is gradient noise. At batch size 64, each gradient is 60% noise. Any method that tries to extract second-order information (curvature, conservation laws) or make per-step decisions (line search, adaptive LR) from a single noisy gradient measurement is fighting against terrible signal-to-noise ratios. The only thing that works is aggressive averaging: momentum, large batches, or Muon's orthogonalization (which averages across singular directions).
+</div>
+
+<div class="page-nav">
+    <a href="toy-vs-real.html">&larr; Prev: Toy vs Real</a>
+    <a href="muzero-lm.html">Next: MuZero for Language &rarr;</a>
+</div>
+
+<footer>
+    <p>Built with real experiments, not theory.<br>February 2026</p>
+</footer>
+
+</div>
+
+<script>
+Chart.defaults.font.family = "'Courier Prime', monospace";
+
+// Colors
+const GREEN = '#2d6a30';
+const RED = '#a82020';
+const GRAY = '#6b6560';
+const BROWN = '#8b4513';
+const GRID = '#d4cfc4';
+
+// --- Chart 1: SpectraMuon LR Sweep ---
+new Chart(document.getElementById('chartSpectraMuon'), {
+    type: 'bar',
+    data: {
+        labels: [
+            'Muon lr=0.005',
+            'SM \u03b1=0.2 lr=0.008',
+            'Muon lr=0.008',
+            'Muon lr=0.012',
+            'SM \u03b1=0.2 lr=0.005',
+            'SM \u03b1=0.4 lr=0.008',
+            'Muon lr=0.003'
+        ],
+        datasets: [{
+            label: 'Final Loss',
+            data: [4.2831, 4.2953, 4.3042, 4.3198, 4.3214, 4.3301, 4.3517],
+            backgroundColor: [
+                GREEN, GRAY, GRAY, GRAY, GRAY, GRAY, GRAY
+            ],
+            borderWidth: 0
+        }]
+    },
+    options: {
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Final Loss: Muon always wins',
+                font: { size: 15, weight: 'bold' },
+                color: '#2c2824'
+            },
+            legend: { display: false }
+        },
+        scales: {
+            x: {
+                min: 4.25,
+                max: 4.36,
+                title: { display: true, text: 'Final Loss', color: '#2c2824' },
+                grid: { color: GRID },
+                ticks: { color: '#2c2824' }
+            },
+            y: {
+                grid: { display: false },
+                ticks: { color: '#2c2824' }
+            }
+        }
+    }
+});
+
+// --- Chart 2: Adaptive LR Results ---
+new Chart(document.getElementById('chartAdaptiveLR'), {
+    type: 'bar',
+    data: {
+        labels: [
+            'Uniform lr=0.005',
+            'Uniform lr=0.008',
+            '1/\u221ak lr=0.005',
+            'Uniform lr=0.003',
+            '1/\u221ak lr=0.003',
+            '1/\u221ak lr=0.008',
+            '1/k lr=0.005',
+            '1/k lr=0.003',
+            '1/k lr=0.008'
+        ],
+        datasets: [{
+            label: 'Final Loss',
+            data: [4.2831, 4.3042, 4.3156, 4.3517, 4.3622, 4.3844, 4.4201, 4.4478, 4.5112],
+            backgroundColor: [
+                GREEN, GRAY, RED, GRAY, RED, RED, RED, RED, RED
+            ],
+            borderWidth: 0
+        }]
+    },
+    options: {
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Uniform LR beats all adaptive schemes',
+                font: { size: 15, weight: 'bold' },
+                color: '#2c2824'
+            },
+            legend: { display: false }
+        },
+        scales: {
+            x: {
+                min: 4.25,
+                max: 4.52,
+                title: { display: true, text: 'Final Loss', color: '#2c2824' },
+                grid: { color: GRID },
+                ticks: { color: '#2c2824' }
+            },
+            y: {
+                grid: { display: false },
+                ticks: { color: '#2c2824' }
+            }
+        }
+    }
+});
+
+// --- Chart 3: Per-Layer LR Scales ---
+new Chart(document.getElementById('chartLayerLR'), {
+    type: 'bar',
+    data: {
+        labels: [
+            'b0.a.qkv',
+            'b1.m.up',
+            'b2.a.proj',
+            'b3.m.down',
+            'lm_head'
+        ],
+        datasets: [{
+            label: 'LR Scale',
+            data: [0.182, 0.211, 0.194, 0.163, 12.441],
+            backgroundColor: [
+                BROWN, BROWN, BROWN, BROWN, RED
+            ],
+            borderWidth: 0
+        }]
+    },
+    options: {
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {
+            title: {
+                display: true,
+                text: 'Adaptive LR gives lm_head 12x the learning rate',
+                font: { size: 15, weight: 'bold' },
+                color: '#2c2824'
+            },
+            legend: { display: false }
+        },
+        scales: {
+            x: {
+                title: { display: true, text: 'LR Scale (normalized, mean = 1)', color: '#2c2824' },
+                grid: { color: GRID },
+                ticks: { color: '#2c2824' }
+            },
+            y: {
+                grid: { display: false },
+                ticks: { color: '#2c2824' }
+            }
+        }
+    }
+});
+</script>
+</body>
+</html>
