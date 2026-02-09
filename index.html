@@ -22,6 +22,11 @@
     Most of it didn't work. Here's what I measured.
 </p>
 
+<div class="callout" style="margin: 24px 0 32px;">
+    <p style="margin:0 0 8px"><strong>Everything here was run on a single M4 Mac Mini (24GB).</strong></p>
+    <p style="margin:0; font-size: 0.92em;">That means small models (5M-73M params), small batch sizes (8-64), and short training runs. The one exception is MuZero-LM, which used a RunPod L40S. Some of these results &mdash; especially the ones that depend on batch size or model scale &mdash; might look different on bigger hardware. I'm reporting what I measured, not claiming it generalizes. Take it for what it is: one person's experiments on a desktop computer.</p>
+</div>
+
 <ul class="post-list">
     <li>
         <a href="posts/gradient-descent.html">What Gradient Descent Actually Does</a>
