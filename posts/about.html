@@ -26,11 +26,14 @@
     <li><strong>Toy model:</strong> 5M param custom GPT, synthetic bigram data</li>
     <li><strong>Real model:</strong> 73M param nanochat (Karpathy), FineWeb-Edu</li>
     <li><strong>MuZero LM:</strong> 27M param transformer + world model, TinyStories</li>
-    <li><strong>Hardware:</strong> M4 Mac Mini (experiments), L40S (MuZero training)</li>
+    <li><strong>Hardware:</strong> M4 Mac Mini 24GB (all experiments except MuZero)</li>
+    <li><strong>MuZero hardware:</strong> RunPod L40S (single GPU, ~4 hours training)</li>
     <li><strong>Optimizer:</strong> Muon + AdamW (nanochat default)</li>
 </ul>
 
 <p>Every number comes from an actual experiment. No theory-only claims. All code and raw results are reproducible.</p>
+
+<p><strong>Compute limitations:</strong> Running on a Mac Mini means small batch sizes (8-64), short training runs (1000-5000 steps), and no multi-GPU parallelism. Some findings may not transfer to proper scale. The gradient rank measurements in particular are batch-size sensitive &mdash; larger batches produce cleaner, lower-rank gradient signals.</p>
 
 <h2>Why publish failures</h2>
 
